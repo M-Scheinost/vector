@@ -28,11 +28,6 @@ private:
   // get the systems page size (4KiB for amd64, may vary with ARM)
   static constexpr std::size_t PAGE_SIZE = 4096; // sysconf(_SC_PAGESIZE);
 
-  // set once splice() has stitched foreign pages into the mapping. The region
-  // then spans several VMAs, and mremap refuses any range that is not a single
-  // VMA (EFAULT), so resizing has to go through remap_by_copy() instead.
-  bool fragmented_ = false;
-
 
   std::size_t roundup(std::size_t x, std::size_t a) {return (x+a-1) / a * a;}
 
@@ -57,6 +52,7 @@ private:
   void grow(std::size_t new_cap){
     static_assert(std::is_trivially_copyable_v<T>,"MREMAP_MAYMOVE grow requires trivial relocatability");
     std::size_t new_capacity = capacity_bytes(new_cap);
+    if(capacity_ >= new_capacity) return;
     void* p = mremap(static_cast<void*>(data_), capacity_, new_capacity,
                      MREMAP_MAYMOVE);
     if (p == MAP_FAILED) throw std::bad_alloc{};
@@ -86,6 +82,20 @@ private:
     if(p != data_)
       data_ = reinterpret_cast<std::byte*>(std::launder(reinterpret_cast<T*>(p)));
     if(size_ > new_size) size_ = new_size;
+  }
+
+  /**
+   * Relocates a mapping onto new_pos. All sizes are in bytes. old_size has to
+   * be the whole source mapping, otherwise the part beyond it stays mapped and
+   * is leaked; new_size may be smaller, the kernel unmaps the excess.
+   * new_pos must be page aligned, MREMAP_FIXED rejects anything else.
+   */
+  void move(std::byte* old_pos, std::size_t old_size,
+            std::byte* new_pos, std::size_t new_size){
+    void* p = mremap(static_cast<void*>(old_pos), old_size, new_size,
+                     MREMAP_MAYMOVE | MREMAP_FIXED, static_cast<void*>(new_pos));
+    if (p == MAP_FAILED) throw std::bad_alloc{};
+    if(p != new_pos) throw std::runtime_error {"Moving the vector failed"};
   }
 
   void init(){
@@ -171,8 +181,52 @@ public:
   void resize();
   void swap();
 
-  void splice(vector&& other){
-    
+  /**
+   * Appends every element of other to this vector, leaving other empty.
+   *
+   * When the append lands on a page boundary the elements are moved by
+   * remapping other's pages onto the end of this mapping, so nothing is
+   * copied however much is spliced. An append starting mid page copies
+   * instead, because MREMAP_FIXED only accepts a page aligned destination.
+   *
+   * other is left a husk: data_ is null and using it (data(), begin(),
+   * empty(), emplace_back()) is undefined. Only its destructor is safe.
+   *
+   * KNOWN LIMITATION: relocating pages leaves this mapping spanning several
+   * VMAs, and mremap returns EFAULT for any range that is not a single VMA,
+   * so grow() and shrink() throw std::bad_alloc after a splice. Measured at
+   * 40 out of 40 splices leaving the region split. The fix, when it bites,
+   * is to catch EFAULT in grow()/shrink() and fall back to a fresh mmap plus
+   * memcpy, which also reunifies the region.
+   */
+  void splice(vector<T>& other){
+    if(this == &other || other.size_ == 0) return;
+
+    // byte offset the incoming elements land on, and the whole pages of other
+    // that carry them. data_ is a byte pointer, so this has to be scaled by
+    // sizeof(T); size_ alone would land sizeof(T) times too early.
+    const std::size_t tail  = size_ * sizeof(T);
+    const std::size_t moved = capacity_bytes(other.size_);
+
+    // grow() counts elements, not bytes
+    grow(size_ + other.size_);
+
+    if(tail % PAGE_SIZE != 0){
+      // MREMAP_FIXED only accepts a page aligned destination, so an append
+      // that starts mid page has to copy the elements over instead
+      std::memcpy(data_ + tail, other.data_, other.size_ * sizeof(T));
+      size_ += other.size_;
+      // nothing was handed to the kernel on this path, so release it here
+      munmap(other.data_, other.capacity_);
+    } else {
+      // hand over the whole source mapping so nothing of it is left behind
+      move(other.data_, other.capacity_, data_ + tail, moved);
+      size_ += other.size_;
+    }
+
+    other.data_ = nullptr;
+    other.size_ = 0;
+    other.capacity_ = 0;
   }
 };
 

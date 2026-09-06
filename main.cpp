@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <fstream>
 #include <unistd.h>
+#include <format>
 
 #include "vector.hpp"
 
@@ -15,9 +16,8 @@ struct vma_region {
   std::size_t bytes() const { return end - start; }
 
   std::string to_string(){
-    return "start:\t" + std::to_string(start)
-      + "\tend:\t" + std::to_string(end)
-      + "\t" + perms + "\tsize:\t" + std::to_string(bytes());
+   return std::format("0x{:012x}-0x{:012x}\t{}\tsize:\t{:>8}",
+                   start, end, perms, bytes());
   }
 };
 
@@ -43,15 +43,46 @@ inline std::vector<vma_region> read_vma_map(){
   return out;
 }
 
+void print_vma_report(){
+  auto mappings = read_vma_map();
+  std::cout << "index\tstart-end\tperms\tsize" << std::endl;
+  int i = 0;
+  for(auto& map: mappings){
+    std::cout << std::to_string(++i) << ":\t" << map.to_string() << std::endl;
+  }
+}
+
 
 
 
 int main(){
-  msc::vector<int> a {1 << 20};
+  msc::vector<int> a;
+  msc::vector<int> b;
+  size_t counter = (1024*1024);
+  // give b a distinct range so that a[counter + j] can only be right if the
+  // elements really came from b, rather than a's own data being duplicated
+  for(size_t i = 0; i < counter; ++i){
+    a.emplace_back(i);
+    b.emplace_back(counter + i);
+  }
+  std::cout << "a:\t" << std::hex << a.data() << "\tb:\t" << b.data() << std::endl;
+  print_vma_report();
 
-  auto mappings = read_vma_map();
-  for(auto& map: mappings){
-    std::cout << map.to_string() << std::endl;
+  for(size_t i = 0; i < counter; ++i){
+    if(a[i] != static_cast<int>(i)) throw std::runtime_error {"err"};
+  }
+
+  a.splice(b);
+  
+  std::cout << "a:\t" << std::hex << a.data() << "\tb:\t" << b.data() << std::endl;
+  print_vma_report();
+
+  for(size_t i = 0; i < counter; ++i){
+    if(a[i] != static_cast<int>(i)) throw std::runtime_error {"err1: " + std::to_string(i)};
+  }
+
+  for(size_t i = counter; i < 2*counter; ++i){
+    if(a[i] != static_cast<int>(i)) throw std::runtime_error {"err2 " + std::to_string(i)};
   }
  
 }

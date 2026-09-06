@@ -562,3 +562,118 @@ TEST(vector, reserve)
   ASSERT_EQ(b.size(), 0);
   ASSERT_GE(b.capacity(), size);
 }
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Modifiers
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+TEST(vector, splice)
+{
+  // TEST_SIZE ints is exactly one page, so the append starts on a page
+  // boundary and takes the zero copy path that relocates the source pages
+  msc::vector<int> a {};
+  msc::vector<int> b {};
+  fill(a, TEST_SIZE);
+  fill(b, TEST_SIZE);
+  ASSERT_EQ((a.size() * sizeof(int)) % PAGE_SIZE, 0);
+
+  a.splice(b);
+
+  // size has to account for the elements that came across
+  ASSERT_EQ(a.size(), TEST_SIZE * 2);
+  ASSERT_EQ(a.end() - a.begin(), static_cast<std::ptrdiff_t>(TEST_SIZE * 2));
+  ASSERT_GE(a.capacity(), TEST_SIZE * 2);
+
+  // the destination keeps its own elements, which is what the byte vs element
+  // mix up used to destroy from index 262144 onwards
+  for(size_t i = 0; i < TEST_SIZE; ++i){
+    ASSERT_EQ(a[i], static_cast<int>(i));
+  }
+  // followed by every element of the source, in order
+  for(size_t i = 0; i < TEST_SIZE; ++i){
+    ASSERT_EQ(a[TEST_SIZE + i], static_cast<int>(i));
+  }
+
+  // and they are one contiguous run, readable through the iterators
+  ASSERT_EQ(a.front(), 0);
+  ASSERT_EQ(a.back(), static_cast<int>(TEST_SIZE - 1));
+  size_t seen = 0;
+  for(int& x : a){
+    ASSERT_EQ(x, static_cast<int>(seen % TEST_SIZE));
+    ++seen;
+  }
+  ASSERT_EQ(seen, TEST_SIZE * 2);
+}
+
+
+TEST(vector, splice_unaligned)
+{
+  // an append that does not start on a page boundary copies instead of
+  // relocating, because MREMAP_FIXED needs a page aligned destination
+  msc::vector<int> a {};
+  msc::vector<int> b {};
+  fill(a, 3);
+  fill(b, TEST_SIZE);
+  ASSERT_NE((a.size() * sizeof(int)) % PAGE_SIZE, 0);
+
+  a.splice(b);
+
+  ASSERT_EQ(a.size(), TEST_SIZE + 3);
+  ASSERT_EQ(a.end() - a.begin(), static_cast<std::ptrdiff_t>(TEST_SIZE + 3));
+  ASSERT_GE(a.capacity(), TEST_SIZE + 3);
+
+  for(size_t i = 0; i < 3; ++i){
+    ASSERT_EQ(a[i], static_cast<int>(i));
+  }
+  for(size_t i = 0; i < TEST_SIZE; ++i){
+    ASSERT_EQ(a[3 + i], static_cast<int>(i));
+  }
+}
+
+
+TEST(vector, splice_edge_cases)
+{
+  // an empty source leaves the destination untouched
+  msc::vector<int> a {};
+  msc::vector<int> empty {};
+  fill(a, TEST_SIZE);
+  a.splice(empty);
+  ASSERT_EQ(a.size(), TEST_SIZE);
+  for(size_t i = 0; i < TEST_SIZE; ++i){
+    ASSERT_EQ(a[i], static_cast<int>(i));
+  }
+
+  // splicing a vector into itself is a no op rather than a corruption
+  a.splice(a);
+  ASSERT_EQ(a.size(), TEST_SIZE);
+  for(size_t i = 0; i < TEST_SIZE; ++i){
+    ASSERT_EQ(a[i], static_cast<int>(i));
+  }
+
+  // an empty destination takes everything, appending at offset 0
+  msc::vector<int> c {};
+  msc::vector<int> d {};
+  fill(d, TEST_SIZE);
+  c.splice(d);
+  ASSERT_EQ(c.size(), TEST_SIZE);
+  for(size_t i = 0; i < TEST_SIZE; ++i){
+    ASSERT_EQ(c[i], static_cast<int>(i));
+  }
+
+  // a class type splices the same way. sizeof(A) divides the page size, so
+  // filling one page worth keeps the append page aligned
+  const size_t per_page = PAGE_SIZE / sizeof(A);
+  msc::vector<A> e {};
+  msc::vector<A> f {};
+  fill(e, per_page);
+  fill(f, 64);
+  e.splice(f);
+  ASSERT_EQ(e.size(), per_page + 64);
+  for(size_t i = 0; i < per_page; ++i){
+    ASSERT_EQ(e[i], A{i});
+  }
+  for(size_t i = 0; i < 64; ++i){
+    ASSERT_EQ(e[per_page + i], A{i});
+  }
+}
