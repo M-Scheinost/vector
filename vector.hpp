@@ -224,7 +224,7 @@ public:
       size_ += other.size_;
     }
 
-    other.data_ = nullptr;
+    // other.data_ = nullptr;
     other.size_ = 0;
     other.capacity_ = 0;
   }

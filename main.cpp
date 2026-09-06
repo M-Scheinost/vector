@@ -59,11 +59,9 @@ int main(){
   msc::vector<int> a;
   msc::vector<int> b;
   size_t counter = (1024*1024);
-  // give b a distinct range so that a[counter + j] can only be right if the
-  // elements really came from b, rather than a's own data being duplicated
   for(size_t i = 0; i < counter; ++i){
     a.emplace_back(i);
-    b.emplace_back(counter + i);
+    b.emplace_back(i + counter);
   }
   std::cout << "a:\t" << std::hex << a.data() << "\tb:\t" << b.data() << std::endl;
   print_vma_report();
