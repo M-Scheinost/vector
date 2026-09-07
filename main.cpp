@@ -98,7 +98,7 @@ int main(){
     if(a[i] != static_cast<int>(i)) throw std::runtime_error {"err"};
   }
 
-  a.splice(b);
+  a.splice(std::move(b));
   
   std::cout << "a:\t" << std::hex << a.data() << "\tb:\t" << b.data() << std::endl;
   print_anon_vma_report();
@@ -110,10 +110,5 @@ int main(){
   for(size_t i = counter; i < 2*counter; ++i){
     if(a[i] != static_cast<int>(i)) throw std::runtime_error {"err2 " + std::to_string(i)};
   }
-
-  struct vm_area_struct *vma = vma_lookup(task->mm, 0x13000);
-
-  if (!vma)
-    return -EFAULT;
  
 }

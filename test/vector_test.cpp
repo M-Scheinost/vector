@@ -578,7 +578,7 @@ TEST(vector, splice)
   fill(b, TEST_SIZE);
   ASSERT_EQ((a.size() * sizeof(int)) % PAGE_SIZE, 0);
 
-  a.splice(b);
+  a.splice(std::move(b));
 
   // size has to account for the elements that came across
   ASSERT_EQ(a.size(), TEST_SIZE * 2);
@@ -617,7 +617,7 @@ TEST(vector, splice_unaligned)
   fill(b, TEST_SIZE);
   ASSERT_NE((a.size() * sizeof(int)) % PAGE_SIZE, 0);
 
-  a.splice(b);
+  a.splice(std::move(b));
 
   ASSERT_EQ(a.size(), TEST_SIZE + 3);
   ASSERT_EQ(a.end() - a.begin(), static_cast<std::ptrdiff_t>(TEST_SIZE + 3));
@@ -638,14 +638,14 @@ TEST(vector, splice_edge_cases)
   msc::vector<int> a {};
   msc::vector<int> empty {};
   fill(a, TEST_SIZE);
-  a.splice(empty);
+  a.splice(std::move(empty));
   ASSERT_EQ(a.size(), TEST_SIZE);
   for(size_t i = 0; i < TEST_SIZE; ++i){
     ASSERT_EQ(a[i], static_cast<int>(i));
   }
 
   // splicing a vector into itself is a no op rather than a corruption
-  a.splice(a);
+  a.splice(std::move(a));
   ASSERT_EQ(a.size(), TEST_SIZE);
   for(size_t i = 0; i < TEST_SIZE; ++i){
     ASSERT_EQ(a[i], static_cast<int>(i));
@@ -655,7 +655,7 @@ TEST(vector, splice_edge_cases)
   msc::vector<int> c {};
   msc::vector<int> d {};
   fill(d, TEST_SIZE);
-  c.splice(d);
+  c.splice(std::move(d));
   ASSERT_EQ(c.size(), TEST_SIZE);
   for(size_t i = 0; i < TEST_SIZE; ++i){
     ASSERT_EQ(c[i], static_cast<int>(i));
@@ -668,7 +668,7 @@ TEST(vector, splice_edge_cases)
   msc::vector<A> f {};
   fill(e, per_page);
   fill(f, 64);
-  e.splice(f);
+  e.splice(std::move(f));
   ASSERT_EQ(e.size(), per_page + 64);
   for(size_t i = 0; i < per_page; ++i){
     ASSERT_EQ(e[i], A{i});
