@@ -115,9 +115,61 @@ public:
     init();
   }
 
-  vector(std::size_t size){
+  explicit vector(std::size_t size){
     capacity_ = capacity_bytes(size);
     init();
+  }
+
+  vector(const vector& other) : capacity_(other.capacity_) {
+    init();
+    try{
+      std::uninitialized_copy_n(reinterpret_cast<const T*>(other.data_),other.size_, data());
+    } catch(...){
+      munmap(data_, max_capacity_);
+      throw;
+    }
+    size_ = other.size_;
+  }
+  vector(vector&& other) noexcept : data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
+    other.size_     = 0;
+    other.capacity_ = PAGE_SIZE;
+    other.init();
+  }
+
+  vector& operator=(const vector& other){
+    if(this == &other) return *this;
+
+    // assigning to a moved from husk is allowed, but it owns no mapping yet
+    if(!data_){
+      capacity_ = PAGE_SIZE;
+      init();
+    }
+
+    std::destroy_n(data(), size_);
+    size_ = 0;
+
+    // grow() counts elements and only ever grows, so a bigger capacity stays
+    grow(other.size_);
+    std::uninitialized_copy_n(reinterpret_cast<const T*>(other.data_),
+                              other.size_, data());
+    size_ = other.size_;
+    return *this;
+  }
+
+  vector& operator=(vector&& other) noexcept {
+    if(this == &other) return *this;
+
+    std::destroy_n(data(), size_);
+    if(data_) munmap(data_, max_capacity_);
+
+    data_     = other.data_;
+    size_     = other.size_;
+    capacity_ = other.capacity_;
+
+    other.size_     = 0;
+    other.capacity_ = PAGE_SIZE;
+    other.init();
+    return *this;
   }
 
   ~vector(){
