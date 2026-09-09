@@ -8,6 +8,7 @@
 #include <numeric>
 #include <iterator>
 #include <concepts>
+#include <type_traits>
 
 struct A {
   int a;
@@ -19,6 +20,53 @@ struct A {
   A(size_t i) : a(static_cast<int>(i)) , b(static_cast<double>(i)), c(static_cast<bool>(i)) , d(static_cast<char>(i)), e(i) {}
   bool operator==(const A& other) const {return a==other.a && b==other.b && c==other.c && d == other.d && e == other.e;}
 };
+
+/**
+ * Non-trivially constructible and destructible, unlike A, so that the vector
+ * has to run a real constructor and destructor for every element instead of
+ * getting away with raw bytes. Every instance is counted, which lets a test
+ * check the two are balanced and that nothing is constructed twice or leaked.
+ *
+ * The payload lives on the heap and the object holds no pointer into itself,
+ * so an instance stays valid when its bytes are moved to another address.
+ * A std::string member would not survive that: a short string points into its
+ * own storage, which grow() and splice() would leave dangling.
+ */
+struct B {
+  static inline size_t live        = 0;
+  static inline size_t constructed = 0;
+  static inline size_t destroyed   = 0;
+
+  static void reset(){ live = 0; constructed = 0; destroyed = 0; }
+
+  int* payload;
+
+  explicit B(size_t i) : payload(new int(static_cast<int>(i))){
+    ++live; ++constructed;
+  }
+  B(const B& other) : payload(new int(*other.payload)){
+    ++live; ++constructed;
+  }
+  B& operator=(const B& other){
+    *payload = *other.payload;
+    return *this;
+  }
+  ~B(){
+    delete payload;
+    payload = nullptr;
+    --live; ++destroyed;
+  }
+
+  int value() const { return *payload; }
+  bool operator==(const B& other) const { return *payload == *other.payload; }
+};
+
+static_assert(!std::is_trivially_default_constructible_v<B>);
+static_assert(!std::is_trivially_destructible_v<B>);
+static_assert(!std::is_trivially_copyable_v<B>);
+// A is the opposite on every count, which is what makes the pair useful
+static_assert(std::is_trivially_destructible_v<A>);
+static_assert(std::is_trivially_copyable_v<A>);
 
 
 namespace {
@@ -676,4 +724,109 @@ TEST(vector, splice_edge_cases)
   for(size_t i = 0; i < 64; ++i){
     ASSERT_EQ(e[per_page + i], A{i});
   }
+}
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Object lifetime, with a type the vector cannot treat as raw bytes
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+TEST(vector, non_trivial_lifetime)
+{
+  B::reset();
+  {
+    msc::vector<B> a {};
+    fill(a, TEST_SIZE);
+
+    // emplace_back constructs in place, exactly once per element
+    ASSERT_EQ(B::constructed, TEST_SIZE);
+    ASSERT_EQ(B::destroyed, 0u);
+    ASSERT_EQ(B::live, TEST_SIZE);
+
+    for(size_t i = 0; i < TEST_SIZE; ++i){
+      ASSERT_EQ(a[i].value(), static_cast<int>(i));
+    }
+
+    // growing extends the mapping in place, so the elements already there are
+    // neither relocated nor destroyed and no copy constructor runs for them
+    size_t before = B::constructed;
+    grow_once(a);
+    ASSERT_EQ(B::destroyed, 0u);
+    ASSERT_EQ(B::constructed - before, a.size() - TEST_SIZE);
+    for(size_t i = 0; i < TEST_SIZE; ++i){
+      ASSERT_EQ(a[i].value(), static_cast<int>(i));
+    }
+  }
+  // leaving the scope runs one destructor per live element, and no more
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
+}
+
+
+TEST(vector, non_trivial_clear)
+{
+  B::reset();
+  {
+    msc::vector<B> a {};
+    fill(a, TEST_SIZE);
+    ASSERT_EQ(B::live, TEST_SIZE);
+
+    a.clear();
+
+    // clear() destroys what it drops rather than just forgetting the count
+    ASSERT_EQ(B::live, 0u);
+    ASSERT_EQ(B::destroyed, TEST_SIZE);
+    ASSERT_EQ(a.size(), 0u);
+    ASSERT_TRUE(a.empty());
+
+    // and the storage stays usable afterwards
+    fill(a, TEST_SIZE);
+    ASSERT_EQ(B::live, TEST_SIZE);
+    for(size_t i = 0; i < TEST_SIZE; ++i){
+      ASSERT_EQ(a[i].value(), static_cast<int>(i));
+    }
+  }
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
+}
+
+
+TEST(vector, non_trivial_pop_back)
+{
+  B::reset();
+  {
+    msc::vector<B> a {};
+    fill(a, TEST_SIZE);
+
+    // pop_back destroys the element it drops, it does not just forget the count
+    for(size_t i = 0; i < TEST_SIZE; ++i){
+      a.pop_back();
+      ASSERT_EQ(B::live, TEST_SIZE - i - 1);
+    }
+    ASSERT_EQ(a.size(), 0u);
+    ASSERT_TRUE(a.empty());
+  }
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
+}
+
+
+TEST(vector, non_trivial_reserve)
+{
+  B::reset();
+  {
+    msc::vector<B> a {};
+    a.reserve(TEST_SIZE * 4);
+
+    // reserve only maps storage, it must not construct anything into it
+    ASSERT_EQ(B::constructed, 0u);
+    ASSERT_EQ(a.size(), 0u);
+    ASSERT_GE(a.capacity(), TEST_SIZE * 4);
+
+    fill(a, TEST_SIZE);
+    ASSERT_EQ(B::constructed, TEST_SIZE);
+    ASSERT_EQ(B::live, TEST_SIZE);
+  }
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
 }

@@ -81,6 +81,7 @@ private:
     if(size_ > new_size) size_ = new_size;
   } 
 
+
   /**
    * Relocates a mapping onto new_pos. All sizes are in bytes. old_size has to
    * be the whole source mapping, otherwise the part beyond it stays mapped and
@@ -95,16 +96,16 @@ private:
     if(p != new_pos) throw std::runtime_error {"Moving the vector failed"};
   }
 
+
   void init(){
      void* p = mmap(nullptr, max_capacity_,
                     PROT_NONE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                     -1, 0);
-    if (p == MAP_FAILED) throw std::bad_alloc{};
+    if(p == MAP_FAILED) throw std::bad_alloc{};
     data_ = static_cast<std::byte*>(p);
     int success = mprotect(static_cast<void*>(data_), capacity_, PROT_READ | PROT_WRITE);
-    if (success) throw std::bad_alloc{};
-    
+    if(success) throw std::bad_alloc{}; 
   }
 
 
@@ -187,29 +188,23 @@ public:
   }
 
   void append_range();
-  void pop_back(){size_--;}
+  void pop_back(){ --size_; std::destroy_at(data() + size_); }
   void resize();
   void swap();
 
   void splice(vector<T>&& other){
     if(this == &other || other.size_ == 0) return;
 
-    // byte offset the incoming elements land on, and the whole pages of other
-    // that carry them. data_ is a byte pointer, so this has to be scaled by
-    // sizeof(T); size_ alone would land sizeof(T) times too early.
     const std::size_t tail  = size_ * sizeof(T);
     const std::size_t moved = capacity_bytes(other.size_);
 
-    // grow() counts elements, not bytes
     grow(size_ + other.size_);
-
+    // need to redo -> currently we use memcpy if we aren't ending on a page bound
+    // ideally we would like to still move with mremap and only copy the very "tail" at the end of the other vector
+    // this way we might lose order of elements but we don't care most of the time since we only want set properties
     if(tail % PAGE_SIZE != 0){
-      // MREMAP_FIXED only accepts a page aligned destination, so an append
-      // that starts mid page has to copy the elements over instead
       std::memcpy(data_ + tail, other.data_, other.size_ * sizeof(T));
       size_ += other.size_;
-      // nothing was handed to the kernel on this path, so release it here
-      munmap(other.data_, other.capacity_);
     } else {
       // hand over the whole source mapping so nothing of it is left behind
       move(other.data_, other.capacity_, data_ + tail, moved);
