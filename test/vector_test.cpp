@@ -657,8 +657,10 @@ TEST(vector, splice)
 
 TEST(vector, splice_unaligned)
 {
-  // an append that does not start on a page boundary copies instead of
-  // relocating, because MREMAP_FIXED needs a page aligned destination
+  // three ints do not reach one stride, so the landing offset rounds down to 0:
+  // the source takes the front of the mapping and the destination's own three
+  // elements are parked in a buffer and put back behind it. splice does not
+  // preserve order, so the layout is source first, displaced elements last
   msc::vector<int> a {};
   msc::vector<int> b {};
   fill(a, 3);
@@ -671,11 +673,82 @@ TEST(vector, splice_unaligned)
   ASSERT_EQ(a.end() - a.begin(), static_cast<std::ptrdiff_t>(TEST_SIZE + 3));
   ASSERT_GE(a.capacity(), TEST_SIZE + 3);
 
-  for(size_t i = 0; i < 3; ++i){
+  for(size_t i = 0; i < TEST_SIZE; ++i){
     ASSERT_EQ(a[i], static_cast<int>(i));
   }
-  for(size_t i = 0; i < TEST_SIZE; ++i){
-    ASSERT_EQ(a[3 + i], static_cast<int>(i));
+  for(size_t i = 0; i < 3; ++i){
+    ASSERT_EQ(a[TEST_SIZE + i], static_cast<int>(i));
+  }
+}
+
+
+TEST(vector, splice_reordering_keeps_every_element)
+{
+  // whatever path splice takes, the result has to hold exactly the elements of
+  // both inputs. checked as a multiset, which is the contract now that the
+  // displaced elements no longer stay in place
+  for(size_t prefix : {size_t{1}, size_t{2}, PAGE_SIZE/sizeof(int) - 1,
+                       PAGE_SIZE/sizeof(int), PAGE_SIZE/sizeof(int) + 1,
+                       TEST_SIZE + 7}){
+    msc::vector<int> a {};
+    msc::vector<int> b {};
+    fill(a, prefix);
+    fill(b, TEST_SIZE * 4);
+
+    a.splice(std::move(b));
+    ASSERT_EQ(a.size(), prefix + TEST_SIZE * 4) << "prefix " << prefix;
+
+    std::vector<int> got(a.begin(), a.end());
+    std::vector<int> want;
+    for(size_t i = 0; i < prefix; ++i)          want.push_back(static_cast<int>(i));
+    for(size_t i = 0; i < TEST_SIZE * 4; ++i)   want.push_back(static_cast<int>(i));
+    std::sort(got.begin(), got.end());
+    std::sort(want.begin(), want.end());
+    ASSERT_EQ(got, want) << "prefix " << prefix;
+  }
+}
+
+
+TEST(vector, splice_stride_exceeds_page)
+{
+  // sizeof(C) is 24, which does not divide the page size, so a landing offset
+  // has to be a multiple of lcm(4096, 24) == 12288 rather than of 4096. any
+  // page boundary that is not also an element boundary would slice an element
+  struct C {
+    uint64_t a, b, c;
+    explicit C(size_t i) : a(i), b(i*2), c(i*3) {}
+    bool operator==(const C& o) const {return a==o.a && b==o.b && c==o.c;}
+  };
+  static_assert(sizeof(C) == 24);
+  static_assert(PAGE_SIZE % sizeof(C) != 0);
+
+  const size_t stride_elems = std::lcm(sizeof(C), PAGE_SIZE) / sizeof(C);
+  ASSERT_EQ(stride_elems, 512u);
+
+  for(size_t prefix : {size_t{1}, stride_elems - 1, stride_elems,
+                       stride_elems + 3, stride_elems * 2 + 100}){
+    msc::vector<C> a {};
+    msc::vector<C> b {};
+    fill(a, prefix);
+    fill(b, stride_elems * 4);
+
+    a.splice(std::move(b));
+    ASSERT_EQ(a.size(), prefix + stride_elems * 4) << "prefix " << prefix;
+
+    // every element still reads back as a whole C, which is what a landing
+    // offset in the middle of an element would destroy
+    std::vector<uint64_t> got;
+    for(C& x : a){
+      ASSERT_EQ(x.b, x.a * 2) << "prefix " << prefix;
+      ASSERT_EQ(x.c, x.a * 3) << "prefix " << prefix;
+      got.push_back(x.a);
+    }
+    std::vector<uint64_t> want;
+    for(size_t i = 0; i < prefix; ++i)              want.push_back(i);
+    for(size_t i = 0; i < stride_elems * 4; ++i)    want.push_back(i);
+    std::sort(got.begin(), got.end());
+    std::sort(want.begin(), want.end());
+    ASSERT_EQ(got, want) << "prefix " << prefix;
   }
 }
 

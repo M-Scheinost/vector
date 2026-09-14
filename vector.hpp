@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <algorithm>
+#include <numeric>
 
 
 
@@ -31,6 +32,7 @@ private:
 
 
   std::size_t roundup(std::size_t x, std::size_t a) {return (x+a-1) / a * a;}
+  std::size_t rounddown(std::size_t x, std::size_t a) {return x / a * a;}
 
   /**
    * Byte size of a mapping holding n elements, rounded up to whole pages.
@@ -244,24 +246,54 @@ public:
   void resize();
   void swap();
 
+  /**
+   * Appends every element of other to this vector, leaving other empty.
+   *
+   * Wherever it can, the elements are handed over by remapping other's pages
+   * onto this mapping, so nothing is copied however much is spliced. The
+   * landing offset has to clear two bars at once: page aligned, or MREMAP_FIXED
+   * rejects it, and a whole number of elements, or data()[i] stops addressing
+   * elements across the seam. Both hold exactly at the multiples of
+   * lcm(PAGE_SIZE, sizeof(T)), so the end of our elements is rounded down to
+   * one and the few elements that rounding displaces are parked in a buffer
+   * and put back after other's.
+   *
+   * ORDER IS NOT PRESERVED. The displaced elements come back at the end rather
+   * than staying where they were, so the result holds the same elements as an
+   * ordered append but not in the same sequence.
+   *
+   * other is left a husk: data_ is null and using it (data(), begin(), empty(),
+   * emplace_back()) is undefined. Only its destructor is safe.
+   */
   void splice(vector<T>&& other){
     if(this == &other || other.size_ == 0) return;
+
+    constexpr std::size_t stride = std::lcm(sizeof(T), PAGE_SIZE);
 
     const std::size_t tail  = size_ * sizeof(T);
     const std::size_t moved = capacity_bytes(other.size_);
 
+
+    const std::size_t pagebound_size = rounddown(tail, stride);
+    const std::size_t keep  = pagebound_size / sizeof(T);
+    const std::size_t spill = size_ - keep;
+
     grow(size_ + other.size_);
-    // need to redo -> currently we use memcpy if we aren't ending on a page bound
-    // ideally we would like to still move with mremap and only copy the very "tail" at the end of the other vector
-    // this way we might lose order of elements but we don't care most of the time since we only want set properties
-    if(tail % PAGE_SIZE != 0){
-      std::memcpy(data_ + tail, other.data_, other.size_ * sizeof(T));
-      size_ += other.size_;
-    } else {
-      // hand over the whole source mapping so nothing of it is left behind
+
+    if(spill == 0){
+      // we already end on a boundary, so nothing of ours is in the way
       move(other.data_, other.capacity_, data_ + tail, moved);
-      size_ += other.size_;
+    } else if(spill < other.size_){ // copy and of A since its cheaper than copying B
+      const std::size_t spill_bytes = spill * sizeof(T);
+      auto buf = std::make_unique_for_overwrite<std::byte[]>(spill_bytes);
+
+      std::memcpy(buf.get(), data_ + pagebound_size, spill_bytes);
+      move(other.data_, other.capacity_, data_ + pagebound_size, moved);
+      std::memcpy(data_ + pagebound_size + other.size_ * sizeof(T), buf.get(), spill_bytes);
+    } else {
+      std::memcpy(data_ + tail, other.data_, other.size_ * sizeof(T));
     }
+    size_ += other.size_;
 
     munmap(other.data_, max_capacity_);
     other.data_ = nullptr;
