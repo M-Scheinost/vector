@@ -30,7 +30,7 @@ struct A {
  * The payload lives on the heap and the object holds no pointer into itself,
  * so an instance stays valid when its bytes are moved to another address.
  * A std::string member would not survive that: a short string points into its
- * own storage, which grow() and splice() would leave dangling.
+ * own storage, which and splice() would leave dangling.
  */
 struct B {
   static inline size_t live        = 0;
@@ -470,7 +470,7 @@ TEST(vector, max_size)
 {
   msc::vector<int> a {};
 
-  ASSERT_EQ(a.max_size(), (1ull << 48) / sizeof(int));
+  ASSERT_EQ(a.max_size(), (1ull << 40) / sizeof(int));
 
   size_t before = a.max_size();
   fill(a, TEST_SIZE);
@@ -483,7 +483,7 @@ TEST(vector, max_size)
 
   static_assert(sizeof(A) > sizeof(int));
   msc::vector<A> b {};
-  ASSERT_EQ(b.max_size(), (1ull << 48) / sizeof(A));
+  ASSERT_EQ(b.max_size(), (1ull << 40) / sizeof(A));
   ASSERT_LT(b.max_size(), a.max_size());
 }
 

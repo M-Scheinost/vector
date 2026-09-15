@@ -31,15 +31,15 @@ private:
   static constexpr std::size_t max_capacity_ = (1ull<<40);
 
 
-  std::size_t roundup(std::size_t x, std::size_t a) {return (x+a-1) / a * a;}
-  std::size_t rounddown(std::size_t x, std::size_t a) {return x / a * a;}
+  static constexpr std::size_t roundup(std::size_t x, std::size_t a) {return (x+a-1) / a * a;}
+  static constexpr std::size_t rounddown(std::size_t x, std::size_t a) {return x / a * a;}
 
   /**
    * Byte size of a mapping holding n elements, rounded up to whole pages.
    * Never returns 0: mmap and mremap reject zero length mappings with EINVAL,
    * so an empty vector still owns one page and data() stays a valid pointer.
    */
-  std::size_t capacity_bytes(std::size_t n) {
+  static constexpr std::size_t capacity_bytes(std::size_t n) {
     std::size_t bytes = roundup(n * sizeof(T), PAGE_SIZE);
     return bytes == 0 ? PAGE_SIZE : bytes;
   }
@@ -201,7 +201,7 @@ public:
 //----------------------------------------------------------------------------------------------------------------------------------------------------
   bool empty(){return size_ == 0 ? true : false;}
   std::size_t size() const { return size_; }
-  std::size_t max_size() const {return (1ull << 48) / sizeof(T);}
+  constexpr std::size_t max_size() const {return max_capacity_ / sizeof(T);}
   void reserve(std::size_t new_cap){
     if((new_cap*sizeof(T)) > capacity_)
       grow(new_cap);
@@ -247,34 +247,19 @@ public:
   void swap();
 
   /**
-   * Appends every element of other to this vector, leaving other empty.
-   *
-   * Wherever it can, the elements are handed over by remapping other's pages
-   * onto this mapping, so nothing is copied however much is spliced. The
-   * landing offset has to clear two bars at once: page aligned, or MREMAP_FIXED
-   * rejects it, and a whole number of elements, or data()[i] stops addressing
-   * elements across the seam. Both hold exactly at the multiples of
-   * lcm(PAGE_SIZE, sizeof(T)), so the end of our elements is rounded down to
-   * one and the few elements that rounding displaces are parked in a buffer
-   * and put back after other's.
-   *
-   * ORDER IS NOT PRESERVED. The displaced elements come back at the end rather
-   * than staying where they were, so the result holds the same elements as an
-   * ordered append but not in the same sequence.
-   *
-   * other is left a husk: data_ is null and using it (data(), begin(), empty(),
-   * emplace_back()) is undefined. Only its destructor is safe.
+   * Merges two vectors into one.
+   * ORDER IS NOT PRESERVED. Some elements may move to the end of the vector.
    */
   void splice(vector<T>&& other){
     if(this == &other || other.size_ == 0) return;
 
     constexpr std::size_t stride = std::lcm(sizeof(T), PAGE_SIZE);
 
-    const std::size_t tail  = size_ * sizeof(T);
-    const std::size_t moved = capacity_bytes(other.size_);
+    const std::size_t size_in_bytes  = size_ * sizeof(T);
+    const std::size_t other_used_cap = capacity_bytes(other.size_);
 
 
-    const std::size_t pagebound_size = rounddown(tail, stride);
+    const std::size_t pagebound_size = rounddown(size_in_bytes, stride);
     const std::size_t keep  = pagebound_size / sizeof(T);
     const std::size_t spill = size_ - keep;
 
@@ -282,23 +267,24 @@ public:
 
     if(spill == 0){
       // we already end on a boundary, so nothing of ours is in the way
-      move(other.data_, other.capacity_, data_ + tail, moved);
+      move(other.data_, other.capacity_, data_ + size_in_bytes, other_used_cap);
     } else if(spill < other.size_){ // copy and of A since its cheaper than copying B
       const std::size_t spill_bytes = spill * sizeof(T);
       auto buf = std::make_unique_for_overwrite<std::byte[]>(spill_bytes);
 
       std::memcpy(buf.get(), data_ + pagebound_size, spill_bytes);
-      move(other.data_, other.capacity_, data_ + pagebound_size, moved);
+      move(other.data_, other.capacity_, data_ + pagebound_size, other_used_cap);
       std::memcpy(data_ + pagebound_size + other.size_ * sizeof(T), buf.get(), spill_bytes);
     } else {
-      std::memcpy(data_ + tail, other.data_, other.size_ * sizeof(T));
+      std::memcpy(data_ + size_in_bytes, other.data_, other.size_ * sizeof(T));
     }
     size_ += other.size_;
 
     munmap(other.data_, max_capacity_);
-    other.data_ = nullptr;
+    other.capacity_ = PAGE_SIZE;
     other.size_ = 0;
-    other.capacity_ = 0;
+    other.data_ = nullptr;
+    other.init();
   }
 };
 

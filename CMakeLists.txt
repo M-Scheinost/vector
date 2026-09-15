@@ -19,6 +19,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -O3 -ggdb")
 # set(CMAKE_CXX_COMPILER "/usr/bin/g++")
 
 option(TEST "Build the test for the vector" ON)
+option(BENCHMARK "Build the benchmark for the vector" ON)
 
 
 include(FetchContent)
@@ -35,6 +36,20 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(gtest)
 endif()
 
+if(BENCHMARK)
+FetchContent_Declare(
+    perfevent
+    GIT_REPOSITORY https://github.com/viktorleis/perfevent.git
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(perfevent)
+
+# single header without a CMakeLists.txt, so give it a target of its own
+add_library(perfevent INTERFACE)
+target_include_directories(perfevent SYSTEM INTERFACE ${perfevent_SOURCE_DIR})
+endif()
+
 #-------------------------------------------
 # Includes
 #-------------------------------------------
@@ -49,7 +64,7 @@ set_target_properties(vector PROPERTIES LINKER_LANGUAGE CXX)
 
 
 #----------------------------------------------
-#   build vector test executable
+#   build vector main executable
 #----------------------------------------------
 add_executable(main ${CMAKE_SOURCE_DIR}/main.cpp)
 target_link_libraries(main vector gtest)
@@ -60,4 +75,13 @@ target_link_libraries(main vector gtest)
 if(TEST)
 add_executable(vector_test ${CMAKE_SOURCE_DIR}/test/vector_test.cpp)
 target_link_libraries(vector_test vector gtest GTest::gtest_main)
+endif()
+
+
+#----------------------------------------------
+#   build vector test executable
+#----------------------------------------------
+if(BENCHMARK)
+add_executable(bench ${CMAKE_SOURCE_DIR}/bench/bench.cpp)
+target_link_libraries(bench vector perfevent)
 endif()
