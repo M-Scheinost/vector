@@ -27,7 +27,10 @@ private:
   // used to grow / shrink the vector;
   static constexpr double size_multiplier = 1.25;
   // get the systems page size (4KiB for amd64, may vary with ARM)
+  public:
   static constexpr std::size_t PAGE_SIZE = 4096; // sysconf(_SC_PAGESIZE);
+  static constexpr std::size_t COPY_LIMIT = PAGE_SIZE * 128;
+  private:
   static constexpr std::size_t max_capacity_ = (1ull<<40);
 
 
@@ -297,7 +300,7 @@ public:
     
     grow(size_ + other.size_);
     
-    if(other.size_ * sizeof(T) <= PAGE_SIZE*128){
+    if(other.size_ * sizeof(T) <= COPY_LIMIT){
       splice_copy(other);
     }else{
       splice_move(other);

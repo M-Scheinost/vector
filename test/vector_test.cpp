@@ -73,8 +73,20 @@ namespace {
 
 constexpr size_t TEST_SIZE = 1024;
 
-// mirrors msc::vector::PAGE_SIZE, which is private
-constexpr size_t PAGE_SIZE = 4096;
+// taken straight from the vector rather than copied, so the tests cannot drift
+// away from the implementation. neither value depends on T, so any
+// instantiation names the same constant
+constexpr size_t PAGE_SIZE  = msc::vector<int>::PAGE_SIZE;
+
+// the threshold in splice(): a source of at most this many bytes is copied onto
+// the end of the destination, a larger one is relocated with mremap
+constexpr size_t COPY_LIMIT = msc::vector<int>::COPY_LIMIT;
+
+// largest element count that still takes the copy path, and the smallest that
+// takes the move path. asked per T, so they keep working if the limit ever
+// becomes type dependent
+template<class T> constexpr size_t copy_path_count(){ return msc::vector<T>::COPY_LIMIT / sizeof(T); }
+template<class T> constexpr size_t move_path_count(){ return msc::vector<T>::COPY_LIMIT / sizeof(T) + 1; }
 
 /**
  * Appends n elements, element i holding the value i.
@@ -616,34 +628,30 @@ TEST(vector, reserve)
 //    Modifiers
 //----------------------------------------------------------------------------------------------------------------------------------------------------
 
-TEST(vector, splice)
+TEST(vector, splice_copy_path)
 {
-  // TEST_SIZE ints is exactly one page, so the append starts on a page
-  // boundary and takes the zero copy path that relocates the source pages
+  // a source of at most COPY_LIMIT is memcpy'd onto the end of the
+  // destination, so this path is an ordered append: both runs stay intact and
+  // in their original sequence
   msc::vector<int> a {};
   msc::vector<int> b {};
   fill(a, TEST_SIZE);
   fill(b, TEST_SIZE);
-  ASSERT_EQ((a.size() * sizeof(int)) % PAGE_SIZE, 0);
+  ASSERT_LE(b.size() * sizeof(int), COPY_LIMIT);
 
   a.splice(std::move(b));
 
-  // size has to account for the elements that came across
   ASSERT_EQ(a.size(), TEST_SIZE * 2);
   ASSERT_EQ(a.end() - a.begin(), static_cast<std::ptrdiff_t>(TEST_SIZE * 2));
   ASSERT_GE(a.capacity(), TEST_SIZE * 2);
 
-  // the destination keeps its own elements, which is what the byte vs element
-  // mix up used to destroy from index 262144 onwards
   for(size_t i = 0; i < TEST_SIZE; ++i){
     ASSERT_EQ(a[i], static_cast<int>(i));
   }
-  // followed by every element of the source, in order
   for(size_t i = 0; i < TEST_SIZE; ++i){
     ASSERT_EQ(a[TEST_SIZE + i], static_cast<int>(i));
   }
 
-  // and they are one contiguous run, readable through the iterators
   ASSERT_EQ(a.front(), 0);
   ASSERT_EQ(a.back(), static_cast<int>(TEST_SIZE - 1));
   size_t seen = 0;
@@ -654,58 +662,170 @@ TEST(vector, splice)
   ASSERT_EQ(seen, TEST_SIZE * 2);
 }
 
-/*
-need to redo this since we always copy small vector sizes
-TEST(vector, splice_unaligned)
+
+TEST(vector, splice_move_path)
+{
+  // a source above the threshold is relocated instead of copied. the
+  // destination ends exactly on a page boundary here, so nothing of it is
+  // displaced and the result still reads back in order
+  const size_t big = move_path_count<int>();
+  msc::vector<int> a {};
+  msc::vector<int> b {};
+  fill(a, TEST_SIZE);
+  fill(b, big);
+  ASSERT_GT(b.size() * sizeof(int), COPY_LIMIT);
+  ASSERT_EQ((a.size() * sizeof(int)) % PAGE_SIZE, 0);
+
+  a.splice(std::move(b));
+
+  ASSERT_EQ(a.size(), TEST_SIZE + big);
+  for(size_t i = 0; i < TEST_SIZE; ++i){
+    ASSERT_EQ(a[i], static_cast<int>(i));
+  }
+  for(size_t i = 0; i < big; ++i){
+    ASSERT_EQ(a[TEST_SIZE + i], static_cast<int>(i));
+  }
+}
+
+
+TEST(vector, splice_move_path_displaces_tail)
 {
   // three ints do not reach one stride, so the landing offset rounds down to 0:
   // the source takes the front of the mapping and the destination's own three
-  // elements are parked in a buffer and put back behind it. splice does not
-  // preserve order, so the layout is source first, displaced elements last
+  // elements are parked in a buffer and put back behind it. only the move path
+  // reorders, which is why the source has to be over the threshold here
+  const size_t big = move_path_count<int>();
   msc::vector<int> a {};
   msc::vector<int> b {};
   fill(a, 3);
-  fill(b, TEST_SIZE);
+  fill(b, big);
   ASSERT_NE((a.size() * sizeof(int)) % PAGE_SIZE, 0);
 
   a.splice(std::move(b));
 
-  ASSERT_EQ(a.size(), TEST_SIZE + 3);
-  ASSERT_EQ(a.end() - a.begin(), static_cast<std::ptrdiff_t>(TEST_SIZE + 3));
-  ASSERT_GE(a.capacity(), TEST_SIZE + 3);
-
-  for(size_t i = 0; i < TEST_SIZE; ++i){
+  ASSERT_EQ(a.size(), big + 3);
+  ASSERT_EQ(a.end() - a.begin(), static_cast<std::ptrdiff_t>(big + 3));
+  for(size_t i = 0; i < big; ++i){
     ASSERT_EQ(a[i], static_cast<int>(i));
   }
   for(size_t i = 0; i < 3; ++i){
-    ASSERT_EQ(a[TEST_SIZE + i], static_cast<int>(i));
+    ASSERT_EQ(a[big + i], static_cast<int>(i));
   }
 }
-*/
+
+
+TEST(vector, splice_threshold_boundary)
+{
+  // a source of exactly COPY_LIMIT still copies, one element more moves.
+  // both have to end up holding the same elements
+  for(size_t n : {copy_path_count<int>(), move_path_count<int>()}){
+    msc::vector<int> a {};
+    msc::vector<int> b {};
+    fill(a, TEST_SIZE);
+    fill(b, n);
+
+    a.splice(std::move(b));
+    ASSERT_EQ(a.size(), TEST_SIZE + n) << "n " << n;
+
+    std::vector<int> got(a.begin(), a.end());
+    std::vector<int> want;
+    for(size_t i = 0; i < TEST_SIZE; ++i) want.push_back(static_cast<int>(i));
+    for(size_t i = 0; i < n; ++i)         want.push_back(static_cast<int>(i));
+    std::sort(got.begin(), got.end());
+    std::sort(want.begin(), want.end());
+    ASSERT_EQ(got, want) << "n " << n;
+  }
+}
+
+
+TEST(vector, splice_leaves_source_empty_and_usable)
+{
+  // the copy path keeps the source's mapping and the move path gives it a
+  // fresh one, but either way it has to come back as a valid empty vector
+  for(size_t n : {TEST_SIZE, move_path_count<int>()}){
+    msc::vector<int> a {};
+    msc::vector<int> b {};
+    fill(a, TEST_SIZE);
+    fill(b, n);
+
+    a.splice(std::move(b));
+
+    ASSERT_EQ(b.size(), 0u)        << "n " << n;
+    ASSERT_TRUE(b.empty())         << "n " << n;
+    ASSERT_NE(b.data(), nullptr)   << "n " << n;
+    ASSERT_EQ(b.begin(), b.end())  << "n " << n;
+
+    fill(b, 10);
+    ASSERT_EQ(b.size(), 10u) << "n " << n;
+    for(size_t i = 0; i < 10; ++i){
+      ASSERT_EQ(b[i], static_cast<int>(i)) << "n " << n;
+    }
+  }
+}
+
+
+TEST(vector, splice_non_trivial_relocates_without_copying)
+{
+  // both paths move an element's bytes rather than constructing a copy, so no
+  // constructor and no destructor may run for an element that is spliced over
+  for(size_t n : {size_t{64}, move_path_count<B>()}){
+    B::reset();
+    {
+      msc::vector<B> a {};
+      msc::vector<B> b {};
+      fill(a, 40);
+      fill(b, n);
+      const size_t live_before  = B::live;
+      const size_t built_before = B::constructed;
+
+      a.splice(std::move(b));
+
+      ASSERT_EQ(a.size(), 40 + n)              << "n " << n;
+      ASSERT_EQ(B::live, live_before)          << "n " << n;
+      ASSERT_EQ(B::constructed, built_before)  << "n " << n;
+      ASSERT_EQ(B::destroyed, 0u)              << "n " << n;
+
+      std::vector<int> got;
+      for(B& x : a) got.push_back(x.value());
+      std::vector<int> want;
+      for(size_t i = 0; i < 40; ++i) want.push_back(static_cast<int>(i));
+      for(size_t i = 0; i < n; ++i)  want.push_back(static_cast<int>(i));
+      std::sort(got.begin(), got.end());
+      std::sort(want.begin(), want.end());
+      ASSERT_EQ(got, want) << "n " << n;
+    }
+    // every element is destroyed exactly once, by whichever vector owns it
+    ASSERT_EQ(B::live, 0u) << "n " << n;
+    ASSERT_EQ(B::destroyed, B::constructed) << "n " << n;
+  }
+}
+
 
 TEST(vector, splice_reordering_keeps_every_element)
 {
   // whatever path splice takes, the result has to hold exactly the elements of
-  // both inputs. checked as a multiset, which is the contract now that the
-  // displaced elements no longer stay in place
-  for(size_t prefix : {size_t{1}, size_t{2}, PAGE_SIZE/sizeof(int) - 1,
-                       PAGE_SIZE/sizeof(int), PAGE_SIZE/sizeof(int) + 1,
-                       TEST_SIZE + 7}){
-    msc::vector<int> a {};
-    msc::vector<int> b {};
-    fill(a, prefix);
-    fill(b, TEST_SIZE * 4);
+  // both inputs. checked as a multiset, because the move path does not leave
+  // the displaced elements in place
+  for(size_t source : {TEST_SIZE * 4, move_path_count<int>()}){
+    for(size_t prefix : {size_t{1}, size_t{2}, PAGE_SIZE/sizeof(int) - 1,
+                         PAGE_SIZE/sizeof(int), PAGE_SIZE/sizeof(int) + 1,
+                         TEST_SIZE + 7}){
+      msc::vector<int> a {};
+      msc::vector<int> b {};
+      fill(a, prefix);
+      fill(b, source);
 
-    a.splice(std::move(b));
-    ASSERT_EQ(a.size(), prefix + TEST_SIZE * 4) << "prefix " << prefix;
+      a.splice(std::move(b));
+      ASSERT_EQ(a.size(), prefix + source) << "prefix " << prefix << " source " << source;
 
-    std::vector<int> got(a.begin(), a.end());
-    std::vector<int> want;
-    for(size_t i = 0; i < prefix; ++i)          want.push_back(static_cast<int>(i));
-    for(size_t i = 0; i < TEST_SIZE * 4; ++i)   want.push_back(static_cast<int>(i));
-    std::sort(got.begin(), got.end());
-    std::sort(want.begin(), want.end());
-    ASSERT_EQ(got, want) << "prefix " << prefix;
+      std::vector<int> got(a.begin(), a.end());
+      std::vector<int> want;
+      for(size_t i = 0; i < prefix; ++i) want.push_back(static_cast<int>(i));
+      for(size_t i = 0; i < source; ++i) want.push_back(static_cast<int>(i));
+      std::sort(got.begin(), got.end());
+      std::sort(want.begin(), want.end());
+      ASSERT_EQ(got, want) << "prefix " << prefix << " source " << source;
+    }
   }
 }
 
@@ -726,30 +846,33 @@ TEST(vector, splice_stride_exceeds_page)
   const size_t stride_elems = std::lcm(sizeof(C), PAGE_SIZE) / sizeof(C);
   ASSERT_EQ(stride_elems, 512u);
 
-  for(size_t prefix : {size_t{1}, stride_elems - 1, stride_elems,
-                       stride_elems + 3, stride_elems * 2 + 100}){
-    msc::vector<C> a {};
-    msc::vector<C> b {};
-    fill(a, prefix);
-    fill(b, stride_elems * 4);
+  // one source under the copy threshold and one over it, so both paths run
+  for(size_t source : {stride_elems * 4, move_path_count<C>()}){
+    for(size_t prefix : {size_t{1}, stride_elems - 1, stride_elems,
+                         stride_elems + 3, stride_elems * 2 + 100}){
+      msc::vector<C> a {};
+      msc::vector<C> b {};
+      fill(a, prefix);
+      fill(b, source);
 
-    a.splice(std::move(b));
-    ASSERT_EQ(a.size(), prefix + stride_elems * 4) << "prefix " << prefix;
+      a.splice(std::move(b));
+      ASSERT_EQ(a.size(), prefix + source) << "prefix " << prefix << " source " << source;
 
-    // every element still reads back as a whole C, which is what a landing
-    // offset in the middle of an element would destroy
-    std::vector<uint64_t> got;
-    for(C& x : a){
-      ASSERT_EQ(x.b, x.a * 2) << "prefix " << prefix;
-      ASSERT_EQ(x.c, x.a * 3) << "prefix " << prefix;
-      got.push_back(x.a);
+      // every element still reads back as a whole C, which is what a landing
+      // offset in the middle of an element would destroy
+      std::vector<uint64_t> got;
+      for(C& x : a){
+        ASSERT_EQ(x.b, x.a * 2) << "prefix " << prefix << " source " << source;
+        ASSERT_EQ(x.c, x.a * 3) << "prefix " << prefix << " source " << source;
+        got.push_back(x.a);
+      }
+      std::vector<uint64_t> want;
+      for(size_t i = 0; i < prefix; ++i) want.push_back(i);
+      for(size_t i = 0; i < source; ++i) want.push_back(i);
+      std::sort(got.begin(), got.end());
+      std::sort(want.begin(), want.end());
+      ASSERT_EQ(got, want) << "prefix " << prefix << " source " << source;
     }
-    std::vector<uint64_t> want;
-    for(size_t i = 0; i < prefix; ++i)              want.push_back(i);
-    for(size_t i = 0; i < stride_elems * 4; ++i)    want.push_back(i);
-    std::sort(got.begin(), got.end());
-    std::sort(want.begin(), want.end());
-    ASSERT_EQ(got, want) << "prefix " << prefix;
   }
 }
 
