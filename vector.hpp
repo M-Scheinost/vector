@@ -34,6 +34,7 @@ private:
   static constexpr std::size_t roundup(std::size_t x, std::size_t a) {return (x+a-1) / a * a;}
   static constexpr std::size_t rounddown(std::size_t x, std::size_t a) {return x / a * a;}
 
+
   /**
    * Byte size of a mapping holding n elements, rounded up to whole pages.
    * Never returns 0: mmap and mremap reject zero length mappings with EINVAL,
@@ -44,6 +45,7 @@ private:
     return bytes == 0 ? PAGE_SIZE : bytes;
   }
 
+
   /**
    * Grows the vector by the factor size_multiplier
    */
@@ -51,6 +53,7 @@ private:
     std::size_t new_capacity = static_cast<std::size_t>(static_cast<double>(capacity_) * size_multiplier);
     grow(new_capacity / sizeof(T));
   }
+
 
   void grow(std::size_t new_cap){
     std::size_t new_capacity = capacity_bytes(new_cap);
@@ -61,12 +64,14 @@ private:
     capacity_ = new_capacity;
     }
 
-  /**
+
+    /**
    * Shrinks the capacity of vector to size
    */
   void shrink(){
     shrink(size_);
   }
+
 
   /**
    * Shrinks the size of the vector to new size, cuts of elements if size > new_size to size
@@ -110,6 +115,43 @@ private:
     if(success) throw std::bad_alloc{}; 
   }
 
+
+  inline void splice_copy(vector<T>& other){
+    std::memcpy(data_ + (size_*sizeof(T)), other.data_, other.size_*sizeof(T));
+    size_ += other.size_;
+    //other is <= PAGE_SIZE no need to remap
+    memset(other.data_, 0, other.size_ * sizeof(T));
+    other.size_ = 0;
+  }
+
+  inline void splice_move(vector<T>& other){
+    constexpr std::size_t stride = std::lcm(sizeof(T), PAGE_SIZE);
+    const std::size_t size_in_bytes  = size_ * sizeof(T);
+    const std::size_t other_used_cap = capacity_bytes(other.size_);
+    const std::size_t pagebound_size = rounddown(size_in_bytes, stride);
+    const std::size_t keep  = pagebound_size / sizeof(T);
+    const std::size_t spill = size_ - keep;
+
+    if(spill == 0){
+      // we already end on a boundary, so nothing of ours is in the way
+      move(other.data_, other.capacity_, data_ + size_in_bytes, other_used_cap);
+    } else if(spill < other.size_){ // copy end of A since its cheaper than copying B
+      const std::size_t spill_bytes = spill * sizeof(T);
+      auto buf = std::make_unique_for_overwrite<std::byte[]>(spill_bytes);
+      std::memcpy(buf.get(), data_ + pagebound_size, spill_bytes);
+      move(other.data_, other.capacity_, data_ + pagebound_size, other_used_cap);
+      std::memcpy(data_ + pagebound_size + other.size_ * sizeof(T), buf.get(), spill_bytes);
+    } else {
+      std::memcpy(data_ + size_in_bytes, other.data_, other.size_ * sizeof(T));
+    }
+    size_ += other.size_;
+
+    munmap(other.data_, max_capacity_);
+    other.capacity_ = PAGE_SIZE;
+    other.size_ = 0;
+    other.data_ = nullptr;
+    other.init();
+  }
 
 public:
 
@@ -252,39 +294,14 @@ public:
    */
   void splice(vector<T>&& other){
     if(this == &other || other.size_ == 0) return;
-
-    constexpr std::size_t stride = std::lcm(sizeof(T), PAGE_SIZE);
-
-    const std::size_t size_in_bytes  = size_ * sizeof(T);
-    const std::size_t other_used_cap = capacity_bytes(other.size_);
-
-
-    const std::size_t pagebound_size = rounddown(size_in_bytes, stride);
-    const std::size_t keep  = pagebound_size / sizeof(T);
-    const std::size_t spill = size_ - keep;
-
+    
     grow(size_ + other.size_);
-
-    if(spill == 0){
-      // we already end on a boundary, so nothing of ours is in the way
-      move(other.data_, other.capacity_, data_ + size_in_bytes, other_used_cap);
-    } else if(spill < other.size_){ // copy and of A since its cheaper than copying B
-      const std::size_t spill_bytes = spill * sizeof(T);
-      auto buf = std::make_unique_for_overwrite<std::byte[]>(spill_bytes);
-
-      std::memcpy(buf.get(), data_ + pagebound_size, spill_bytes);
-      move(other.data_, other.capacity_, data_ + pagebound_size, other_used_cap);
-      std::memcpy(data_ + pagebound_size + other.size_ * sizeof(T), buf.get(), spill_bytes);
-    } else {
-      std::memcpy(data_ + size_in_bytes, other.data_, other.size_ * sizeof(T));
+    
+    if(other.size_ * sizeof(T) <= PAGE_SIZE*128){
+      splice_copy(other);
+    }else{
+      splice_move(other);
     }
-    size_ += other.size_;
-
-    munmap(other.data_, max_capacity_);
-    other.capacity_ = PAGE_SIZE;
-    other.size_ = 0;
-    other.data_ = nullptr;
-    other.init();
   }
 };
 
