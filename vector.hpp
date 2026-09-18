@@ -8,6 +8,9 @@
 #include <cstring>
 #include <algorithm>
 #include <numeric>
+#include <ranges>
+#include <iterator>
+#include <initializer_list>
 
 
 
@@ -116,6 +119,34 @@ private:
     data_ = static_cast<std::byte*>(p);
     int success = mprotect(static_cast<void*>(data_), capacity_, PROT_READ | PROT_WRITE);
     if(success) throw std::bad_alloc{}; 
+  }
+
+
+  /**
+   * Opens a gap of n uninitialized slots at index idx and hands the first of
+   * them to construct, which has to fill exactly n. The elements from idx
+   * onwards are relocated bitwise, as everywhere else in this class.
+   *
+   * size_ only grows once construct has succeeded, so if it throws the gap is
+   * closed again and the vector is left exactly as it was.
+   */
+  template<class F>
+  T* insert_n(std::size_t idx, std::size_t n, F&& construct){
+    if(n == 0) return data() + idx;
+    grow(size_ + n);
+
+    std::byte* from = data_ + idx * sizeof(T);
+    const std::size_t tail_bytes = (size_ - idx) * sizeof(T);
+    std::memmove(from + n * sizeof(T), from, tail_bytes);
+
+    try {
+      construct(data() + idx);
+    } catch(...) {
+      std::memmove(from, from + n * sizeof(T), tail_bytes);
+      throw;
+    }
+    size_ += n;
+    return data() + idx;
   }
 
 
@@ -238,8 +269,20 @@ public:
 //----------------------------------------------------------------------------------------------------------------------------------------------------
 //    Iterators
 //----------------------------------------------------------------------------------------------------------------------------------------------------
-  T* begin(){ return data(); }
-  T* end(){ return data()+size_; }
+  using value_type = T;
+  using size_type  = std::size_t;
+  using difference_type = std::ptrdiff_t;
+  using reference       = T&;
+  using const_reference = const T&;
+  using pointer         = T*;
+  using const_pointer   = const T*;
+  using iterator   = T*;
+  using const_iterator = const T*;
+  using reverse_iterator = std::reverse_iterator<iterator>;
+  using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+
+  iterator begin(){ return data(); }
+  iterator end(){ return data()+size_; }
 
 //----------------------------------------------------------------------------------------------------------------------------------------------------
 //    Capacity
@@ -267,10 +310,79 @@ public:
     size_ = 0;
     // capacity_ = PAGE_SIZE;
   }
-  void insert();
-  void insert_range();
-  void emplace();
-  void erase();
+  /**
+   * Inserts before pos and returns an iterator to the first element inserted.
+   * Order is preserved: everything from pos onwards moves up, which makes these
+   * linear in the number of elements after pos. splice() stays the one
+   * operation in this class that is allowed to reorder.
+   *
+   * Growing uses mprotect and never relocates the mapping, so pos survives the
+   * growth; it is the shifting that moves elements, not the reallocation.
+   */
+  iterator insert(iterator pos, const T& value){
+    return insert_n(pos - begin(), 1, [&](T* p){ ::new (p) T(value); });
+  }
+
+  iterator insert(iterator pos, T&& value){
+    return insert_n(pos - begin(), 1, [&](T* p){ ::new (p) T(std::move(value)); });
+  }
+
+  iterator insert(iterator pos, size_type count, const T& value){
+    return insert_n(pos - begin(), count,
+                    [&](T* p){ std::uninitialized_fill_n(p, count, value); });
+  }
+
+  template<std::forward_iterator It>
+  iterator insert(iterator pos, It first, It last){
+    const auto count = static_cast<size_type>(std::distance(first, last));
+    return insert_n(pos - begin(), count,
+                    [&](T* p){ std::uninitialized_copy(first, last, p); });
+  }
+
+  iterator insert(iterator pos, std::initializer_list<T> il){
+    return insert(pos, il.begin(), il.end());
+  }
+
+  /**
+   * Copies every element of rg in before pos. The range has to be sized or
+   * multi pass so the count is known before the gap is opened. To move the
+   * elements out of rg instead of copying them, pass std::views::as_rvalue(rg).
+   */
+  template<class R>
+    requires std::ranges::forward_range<R> || std::ranges::sized_range<R>
+  iterator insert_range(iterator pos, R&& rg){
+    const auto count = static_cast<size_type>(std::ranges::distance(rg));
+    return insert_n(pos - begin(), count, [&](T* p){
+      std::uninitialized_copy_n(std::ranges::begin(rg), count, p);
+    });
+  }
+
+  template<class... Args>
+  iterator emplace(iterator pos, Args&&... args){
+    return insert_n(pos - begin(), 1,
+                    [&](T* p){ ::new (p) T(std::forward<Args>(args)...); });
+  }
+
+  /**
+   * Removes [first, last) and closes the gap, returning an iterator to the
+   * element that took first's place. Destructors are noexcept, so nothing here
+   * can fail part way.
+   */
+  iterator erase(iterator first, iterator last){
+    const auto idx = static_cast<size_type>(first - begin());
+    const auto n   = static_cast<size_type>(last - first);
+    if(n == 0) return first;
+
+    std::destroy_n(first, n);
+    std::byte* to = data_ + idx * sizeof(T);
+    std::memmove(to, to + n * sizeof(T), (size_ - idx - n) * sizeof(T));
+    size_ -= n;
+    return data() + idx;
+  }
+
+  iterator erase(iterator pos){
+    return erase(pos, pos + 1);
+  }
   void push_back(const T& val){
     if((size_+1)*sizeof(T) > capacity_) grow();
     data()[size_] = val;

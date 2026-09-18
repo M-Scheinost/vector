@@ -1027,3 +1027,215 @@ TEST(vector, non_trivial_reserve)
   ASSERT_EQ(B::live, 0u);
   ASSERT_EQ(B::destroyed, B::constructed);
 }
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    insert / emplace / erase
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+// expected contents after inserting `inserted` at index `at` into 0..n-1
+std::vector<int> spliced_in(size_t n, size_t at, const std::vector<int>& inserted){
+  std::vector<int> want;
+  for(size_t i = 0; i < at; ++i) want.push_back(static_cast<int>(i));
+  want.insert(want.end(), inserted.begin(), inserted.end());
+  for(size_t i = at; i < n; ++i) want.push_back(static_cast<int>(i));
+  return want;
+}
+
+} // namespace
+
+
+TEST(vector, insert_single)
+{
+  // front, middle and end, since each exercises a different shift length
+  for(size_t at : {size_t{0}, TEST_SIZE / 2, TEST_SIZE}){
+    msc::vector<int> a {};
+    fill(a, TEST_SIZE);
+
+    auto it = a.insert(a.begin() + at, 99);
+
+    ASSERT_EQ(a.size(), TEST_SIZE + 1)            << "at " << at;
+    // the returned iterator points at the element just inserted
+    ASSERT_EQ(it, a.begin() + at)                 << "at " << at;
+    ASSERT_EQ(*it, 99)                            << "at " << at;
+    ASSERT_EQ(std::vector<int>(a.begin(), a.end()),
+              spliced_in(TEST_SIZE, at, {99}))    << "at " << at;
+  }
+}
+
+
+TEST(vector, insert_count)
+{
+  msc::vector<int> a {};
+  fill(a, TEST_SIZE);
+
+  auto it = a.insert(a.begin() + 10, 5, 77);
+
+  ASSERT_EQ(a.size(), TEST_SIZE + 5);
+  ASSERT_EQ(it, a.begin() + 10);
+  ASSERT_EQ(std::vector<int>(a.begin(), a.end()),
+            spliced_in(TEST_SIZE, 10, {77, 77, 77, 77, 77}));
+
+  // a count of zero changes nothing and still returns pos
+  auto none = a.insert(a.begin() + 3, 0, 1);
+  ASSERT_EQ(a.size(), TEST_SIZE + 5);
+  ASSERT_EQ(none, a.begin() + 3);
+}
+
+
+TEST(vector, insert_iterator_pair_and_init_list)
+{
+  msc::vector<int> a {};
+  fill(a, TEST_SIZE);
+  const std::vector<int> src {51, 52, 53};
+
+  auto it = a.insert(a.begin() + 7, src.begin(), src.end());
+  ASSERT_EQ(it, a.begin() + 7);
+  ASSERT_EQ(std::vector<int>(a.begin(), a.end()), spliced_in(TEST_SIZE, 7, src));
+
+  msc::vector<int> b {};
+  fill(b, TEST_SIZE);
+  auto it2 = b.insert(b.begin() + 7, {51, 52, 53});
+  ASSERT_EQ(it2, b.begin() + 7);
+  ASSERT_EQ(std::vector<int>(b.begin(), b.end()), spliced_in(TEST_SIZE, 7, src));
+}
+
+
+TEST(vector, insert_range)
+{
+  const std::vector<int> src {61, 62, 63, 64};
+
+  msc::vector<int> a {};
+  fill(a, TEST_SIZE);
+  auto it = a.insert_range(a.begin() + 20, src);
+  ASSERT_EQ(it, a.begin() + 20);
+  ASSERT_EQ(std::vector<int>(a.begin(), a.end()), spliced_in(TEST_SIZE, 20, src));
+
+  // another msc::vector is a range too
+  msc::vector<int> b {};
+  msc::vector<int> from {};
+  fill(b, TEST_SIZE);
+  for(int v : src) from.emplace_back(v);
+  auto it2 = b.insert_range(b.begin() + 20, from);
+  ASSERT_EQ(it2, b.begin() + 20);
+  ASSERT_EQ(std::vector<int>(b.begin(), b.end()), spliced_in(TEST_SIZE, 20, src));
+  // the source is only read from
+  ASSERT_EQ(from.size(), src.size());
+}
+
+
+TEST(vector, emplace_constructs_in_place)
+{
+  // a type whose constructor takes more than one argument, which is the whole
+  // point of emplace over insert
+  struct P {
+    int x; double y;
+    P(int x, double y) : x(x), y(y) {}
+    bool operator==(const P& o) const { return x == o.x && y == o.y; }
+  };
+
+  msc::vector<P> a {};
+  for(int i = 0; i < 10; ++i) a.emplace_back(i, i * 0.5);
+
+  auto it = a.emplace(a.begin() + 4, 42, 1.5);
+
+  ASSERT_EQ(a.size(), 11u);
+  ASSERT_EQ(it, a.begin() + 4);
+  ASSERT_EQ(*it, (P{42, 1.5}));
+  for(int i = 0; i < 4; ++i)  ASSERT_EQ(a[i], (P{i, i * 0.5}));
+  for(int i = 4; i < 10; ++i) ASSERT_EQ(a[i + 1], (P{i, i * 0.5}));
+}
+
+
+TEST(vector, insert_crosses_capacity)
+{
+  msc::vector<int> a {};
+  fill(a, a.capacity());               // exactly full, the next insert must grow
+  const size_t before = a.size();
+  ASSERT_EQ(a.capacity(), before);
+
+  a.insert(a.begin(), 5, -1);
+
+  ASSERT_EQ(a.size(), before + 5);
+  ASSERT_GT(a.capacity(), before);
+  for(size_t i = 0; i < 5; ++i)      ASSERT_EQ(a[i], -1);
+  for(size_t i = 0; i < before; ++i) ASSERT_EQ(a[5 + i], static_cast<int>(i));
+}
+
+
+TEST(vector, erase_single_and_range)
+{
+  msc::vector<int> a {};
+  fill(a, TEST_SIZE);
+
+  auto it = a.erase(a.begin() + 10);
+  ASSERT_EQ(a.size(), TEST_SIZE - 1);
+  // returns the element that moved into the hole
+  ASSERT_EQ(it, a.begin() + 10);
+  ASSERT_EQ(*it, 11);
+  for(size_t i = 0; i < 10; ++i)             ASSERT_EQ(a[i], static_cast<int>(i));
+  for(size_t i = 10; i < TEST_SIZE - 1; ++i) ASSERT_EQ(a[i], static_cast<int>(i + 1));
+
+  msc::vector<int> b {};
+  fill(b, TEST_SIZE);
+  auto it2 = b.erase(b.begin() + 5, b.begin() + 15);
+  ASSERT_EQ(b.size(), TEST_SIZE - 10);
+  ASSERT_EQ(it2, b.begin() + 5);
+  for(size_t i = 0; i < 5; ++i)              ASSERT_EQ(b[i], static_cast<int>(i));
+  for(size_t i = 5; i < TEST_SIZE - 10; ++i) ASSERT_EQ(b[i], static_cast<int>(i + 10));
+
+  // an empty range is a no op, and erasing everything empties the vector
+  auto same = b.erase(b.begin() + 2, b.begin() + 2);
+  ASSERT_EQ(b.size(), TEST_SIZE - 10);
+  ASSERT_EQ(same, b.begin() + 2);
+
+  auto e = b.erase(b.begin(), b.end());
+  ASSERT_EQ(b.size(), 0u);
+  ASSERT_TRUE(b.empty());
+  ASSERT_EQ(e, b.begin());
+  ASSERT_EQ(b.begin(), b.end());
+
+  // erasing the last element is the same as pop_back
+  msc::vector<int> c {};
+  fill(c, 4);
+  c.erase(c.end() - 1);
+  ASSERT_EQ(c.size(), 3u);
+  ASSERT_EQ(c.back(), 2);
+}
+
+
+TEST(vector, insert_erase_non_trivial)
+{
+  // every inserted element is constructed exactly once and every erased one
+  // destroyed exactly once, which is what a wrong shift length would break
+  B::reset();
+  {
+    msc::vector<B> a {};
+    fill(a, 100);
+    ASSERT_EQ(B::live, 100u);
+
+    a.emplace(a.begin() + 10, 999);
+    ASSERT_EQ(a.size(), 101u);
+    ASSERT_EQ(B::live, 101u);
+    ASSERT_EQ(a[10].value(), 999);
+    ASSERT_EQ(a[11].value(), 10);
+    ASSERT_EQ(B::destroyed, 0u);
+
+    a.erase(a.begin() + 10);
+    ASSERT_EQ(a.size(), 100u);
+    ASSERT_EQ(B::live, 100u);
+    ASSERT_EQ(B::destroyed, 1u);
+    ASSERT_EQ(a[10].value(), 10);
+
+    a.erase(a.begin() + 5, a.begin() + 15);
+    ASSERT_EQ(a.size(), 90u);
+    ASSERT_EQ(B::live, 90u);
+    ASSERT_EQ(B::destroyed, 11u);
+    for(size_t i = 0; i < 5; ++i)  ASSERT_EQ(a[i].value(), static_cast<int>(i));
+    for(size_t i = 5; i < 90; ++i) ASSERT_EQ(a[i].value(), static_cast<int>(i + 10));
+  }
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
+}
