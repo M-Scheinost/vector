@@ -11,6 +11,8 @@
 #include <ranges>
 #include <iterator>
 #include <initializer_list>
+#include <compare>
+#include <concepts>
 
 
 
@@ -39,6 +41,24 @@ private:
 
   static constexpr std::size_t roundup(std::size_t x, std::size_t a) {return (x+a-1) / a * a;}
   static constexpr std::size_t rounddown(std::size_t x, std::size_t a) {return x / a * a;}
+
+
+  /**
+   * The standard's exposition only synth-three-way, used by operator<=>.
+   * An element type that has <=> is ordered by it and keeps its own category;
+   * one that only has < is ordered by two calls to it, which can only ever
+   * justify a weak_ordering. Without this a legacy type with nothing but
+   * operator< would not be comparable at all.
+   */
+  static constexpr auto synth_three_way =
+    []<class U>(const U& a, const U& b){
+      if constexpr (std::three_way_comparable<U>) return a <=> b;
+      else {
+        if(a < b) return std::weak_ordering::less;
+        if(b < a) return std::weak_ordering::greater;
+        return std::weak_ordering::equivalent;
+      }
+    };
 
 
   /**
@@ -189,11 +209,26 @@ private:
 
 public:
 
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Member types
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+  using value_type = T;
+  using size_type  = std::size_t;
+  using difference_type = std::ptrdiff_t;
+  using reference       = T&;
+  using const_reference = const T&;
+  using pointer         = T*;
+  using const_pointer   = const T*;
+  using iterator   = T*;
+  using const_iterator = const T*;
+  using reverse_iterator = std::reverse_iterator<iterator>;
+  using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+
   vector() : capacity_(PAGE_SIZE){
     init();
   }
 
-  explicit vector(std::size_t size){
+  explicit vector(size_type size){
     capacity_ = capacity_bytes(size);
     init();
   }
@@ -258,43 +293,50 @@ public:
 //----------------------------------------------------------------------------------------------------------------------------------------------------
 //    Element access
 //----------------------------------------------------------------------------------------------------------------------------------------------------
-  T& at(std::size_t i){
+  reference at(size_type i){
     if (i >= size_) throw std::out_of_range("vector::at");
     return data()[i];
   }
-  T& operator[](std::size_t i) { return data()[i]; }
-  T& front(){return data()[0];}
-  T& back(){return data()[size_ - 1];}
-  T* data() { return reinterpret_cast<T*>(data_); }
+  const_reference at(size_type i) const {
+    if (i >= size_) throw std::out_of_range("vector::at");
+    return data()[i];
+  }
+  reference       operator[](size_type i)       { return data()[i]; }
+  const_reference operator[](size_type i) const { return data()[i]; }
+  reference       front()       { return data()[0]; }
+  const_reference front() const { return data()[0]; }
+  reference       back()        { return data()[size_ - 1]; }
+  const_reference back()  const { return data()[size_ - 1]; }
+  pointer         data()        { return reinterpret_cast<pointer>(data_); }
+  const_pointer   data()  const { return reinterpret_cast<const_pointer>(data_); }
 //----------------------------------------------------------------------------------------------------------------------------------------------------
 //    Iterators
 //----------------------------------------------------------------------------------------------------------------------------------------------------
-  using value_type = T;
-  using size_type  = std::size_t;
-  using difference_type = std::ptrdiff_t;
-  using reference       = T&;
-  using const_reference = const T&;
-  using pointer         = T*;
-  using const_pointer   = const T*;
-  using iterator   = T*;
-  using const_iterator = const T*;
-  using reverse_iterator = std::reverse_iterator<iterator>;
-  using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+  iterator       begin()       { return data(); }
+  const_iterator begin() const { return data(); }
+  iterator       end()         { return data()+size_; }
+  const_iterator end()   const { return data()+size_; }
+  const_iterator cbegin() const { return begin(); }
+  const_iterator cend()   const { return end(); }
 
-  iterator begin(){ return data(); }
-  iterator end(){ return data()+size_; }
+  reverse_iterator       rbegin()        { return reverse_iterator(end()); }
+  const_reverse_iterator rbegin()  const { return const_reverse_iterator(end()); }
+  reverse_iterator       rend()          { return reverse_iterator(begin()); }
+  const_reverse_iterator rend()    const { return const_reverse_iterator(begin()); }
+  const_reverse_iterator crbegin() const { return rbegin(); }
+  const_reverse_iterator crend()   const { return rend(); }
 
 //----------------------------------------------------------------------------------------------------------------------------------------------------
 //    Capacity
 //----------------------------------------------------------------------------------------------------------------------------------------------------
-  bool empty(){return size_ == 0 ? true : false;}
-  std::size_t size() const { return size_; }
-  constexpr std::size_t max_size() const {return max_capacity_ / sizeof(T);}
-  void reserve(std::size_t new_cap){
+  bool empty() const {return size_ == 0 ? true : false;}
+  size_type size() const { return size_; }
+  constexpr size_type max_size() const {return max_capacity_ / sizeof(T);}
+  void reserve(size_type new_cap){
     if((new_cap*sizeof(T)) > capacity_)
       grow(new_cap);
   }
-  std::size_t capacity() const {return capacity_ / sizeof(T);}
+  size_type capacity() const {return capacity_ / sizeof(T);}
   void shrink_to_fit(){shrink();}
 //----------------------------------------------------------------------------------------------------------------------------------------------------
 //    Modifiers
@@ -417,6 +459,35 @@ public:
     }else{
       splice_move(other);
     }
+  }
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Comparison
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+  /**
+   * Hidden friends, as the standard declares both for std::vector. == is never
+   * synthesized from <=>, so the two are independent and both are needed.
+   *
+   * The constraints keep std::equality_comparable<vector<T>> and
+   * std::three_way_comparable<vector<T>> honest: an element type that cannot be
+   * compared makes the operator drop out of overload resolution instead of
+   * answering "yes" and then hard erroring inside std::equal.
+   */
+  friend bool operator==(const vector& lhs, const vector& rhs)
+    requires std::equality_comparable<T>
+  {
+    // the four iterator form compares the lengths first for random access
+    // iterators, so an unequal size never reaches the element comparisons
+    return std::equal(lhs.begin(), lhs.end(), rhs.begin(), rhs.end());
+  }
+
+  friend auto operator<=>(const vector& lhs, const vector& rhs)
+    requires std::three_way_comparable<T>
+          || requires(const T& a, const T& b){ { a < b } -> std::convertible_to<bool>; }
+  {
+    return std::lexicographical_compare_three_way(
+        lhs.begin(), lhs.end(), rhs.begin(), rhs.end(), synth_three_way);
   }
 };
 

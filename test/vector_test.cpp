@@ -9,6 +9,9 @@
 #include <iterator>
 #include <concepts>
 #include <type_traits>
+#include <compare>
+#include <ranges>
+#include <limits>
 
 struct A {
   int a;
@@ -90,7 +93,8 @@ template<class T> constexpr size_t move_path_count(){ return msc::vector<T>::COP
 
 /**
  * Appends n elements, element i holding the value i.
- * Takes the vector by reference because msc::vector is not copyable or movable yet.
+ * Takes the vector by reference so it fills the caller's vector in place rather
+ * than a copy of it.
  */
 template<class T>
 void fill(msc::vector<T>& v, size_t n){
@@ -408,6 +412,145 @@ TEST(vector, iteration)
     ++k;
   }
   ASSERT_EQ(k, TEST_SIZE);
+}
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Const access
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+// the member aliases are the container's public contract, so pin them down
+// rather than only checking that the accessors are const qualified. asserting
+// both halves means a change to one without the other cannot slip through
+using V = msc::vector<int>;
+static_assert(std::same_as<V::value_type, int>);
+static_assert(std::same_as<V::reference, int&>);
+static_assert(std::same_as<V::const_reference, const int&>);
+static_assert(std::same_as<V::pointer, int*>);
+static_assert(std::same_as<V::const_pointer, const int*>);
+static_assert(std::same_as<V::const_iterator, const int*>);
+
+// only reachable once begin() and end() have const overloads
+static_assert(std::ranges::range<const V>);
+static_assert(std::ranges::contiguous_range<const V>);
+static_assert(std::ranges::sized_range<const V>);
+
+
+TEST(vector, const_element_access)
+{
+  msc::vector<int> a {};
+  fill(a, TEST_SIZE);
+  const msc::vector<int>& c = a;
+
+  static_assert(std::same_as<decltype(c[0]), V::const_reference>);
+  static_assert(std::same_as<decltype(c.at(0)), V::const_reference>);
+  static_assert(std::same_as<decltype(c.front()), V::const_reference>);
+  static_assert(std::same_as<decltype(c.back()), V::const_reference>);
+  static_assert(std::same_as<decltype(c.data()), V::const_pointer>);
+  // the non-const overloads must still win on a non-const object
+  static_assert(std::same_as<decltype(a[0]), V::reference>);
+  static_assert(std::same_as<decltype(a.data()), V::pointer>);
+
+  ASSERT_EQ(c.size(), TEST_SIZE);
+  ASSERT_FALSE(c.empty());
+  ASSERT_EQ(c.front(), 0);
+  ASSERT_EQ(c.back(), static_cast<int>(TEST_SIZE - 1));
+
+  for(size_t i = 0; i < TEST_SIZE; ++i){
+    ASSERT_EQ(c[i], static_cast<int>(i));
+    ASSERT_EQ(c.at(i), static_cast<int>(i));
+    ASSERT_EQ(c.data()[i], static_cast<int>(i));
+    // the const views must name the same storage, not a copy of it
+    ASSERT_EQ(&c[i], &a[i]);
+  }
+
+  ASSERT_EQ(&c.front(), c.data());
+  ASSERT_EQ(&c.back(), c.data() + c.size() - 1);
+
+  ASSERT_THROW(c.at(c.size()), std::out_of_range);
+  ASSERT_THROW(c.at(TEST_SIZE * 2), std::out_of_range);
+  ASSERT_NO_THROW(c.at(TEST_SIZE - 1));
+
+  const msc::vector<int> empty_vec {};
+  ASSERT_TRUE(empty_vec.empty());
+  ASSERT_EQ(empty_vec.size(), 0u);
+  ASSERT_NE(empty_vec.data(), nullptr);
+  ASSERT_THROW(empty_vec.at(0), std::out_of_range);
+}
+
+
+TEST(vector, const_iteration)
+{
+  msc::vector<int> a {};
+  fill(a, TEST_SIZE);
+  const msc::vector<int>& c = a;
+
+  static_assert(std::same_as<decltype(c.begin()), V::const_iterator>);
+  static_assert(std::same_as<decltype(c.cbegin()), V::const_iterator>);
+  static_assert(std::same_as<decltype(a.begin()), V::iterator>);
+
+  ASSERT_EQ(c.begin(), c.data());
+  ASSERT_EQ(c.end() - c.begin(), static_cast<std::ptrdiff_t>(c.size()));
+  ASSERT_EQ(c.cbegin(), c.begin());
+  ASSERT_EQ(c.cend(), c.end());
+  // the const iterators address the same elements as the mutable ones
+  ASSERT_EQ(c.begin(), a.begin());
+
+  size_t i = 0;
+  for(const int& x : c){
+    ASSERT_EQ(x, static_cast<int>(i));
+    ASSERT_EQ(&x, &a[i]);
+    ++i;
+  }
+  ASSERT_EQ(i, TEST_SIZE);
+
+  ASSERT_TRUE(std::is_sorted(c.begin(), c.end()));
+  ASSERT_EQ(std::find(c.cbegin(), c.cend(), 42), c.cbegin() + 42);
+  ASSERT_EQ(std::accumulate(c.begin(), c.end(), 0LL),
+            static_cast<long long>(TEST_SIZE - 1) * static_cast<long long>(TEST_SIZE) / 2);
+
+  const msc::vector<int> empty_vec {};
+  ASSERT_EQ(empty_vec.begin(), empty_vec.end());
+  ASSERT_EQ(empty_vec.rbegin(), empty_vec.rend());
+}
+
+
+TEST(vector, reverse_iteration)
+{
+  msc::vector<int> a {};
+  fill(a, TEST_SIZE);
+  const msc::vector<int>& c = a;
+
+  static_assert(std::same_as<decltype(a.rbegin()), V::reverse_iterator>);
+  static_assert(std::same_as<decltype(c.rbegin()), V::const_reverse_iterator>);
+  static_assert(std::same_as<decltype(c.crbegin()), V::const_reverse_iterator>);
+
+  ASSERT_EQ(a.rend() - a.rbegin(), static_cast<std::ptrdiff_t>(a.size()));
+  ASSERT_EQ(*a.rbegin(), static_cast<int>(TEST_SIZE - 1));
+  ASSERT_EQ(&*a.rbegin(), &a.back());
+  ASSERT_EQ(&*(a.rend() - 1), &a.front());
+
+  // reverse order has to be the forward order read backwards
+  size_t i = TEST_SIZE;
+  for(auto it = c.rbegin(); it != c.rend(); ++it){
+    --i;
+    ASSERT_EQ(*it, static_cast<int>(i));
+    ASSERT_EQ(&*it, &a[i]);
+  }
+  ASSERT_EQ(i, 0u);
+
+  i = TEST_SIZE;
+  for(auto it = c.crbegin(); it != c.crend(); ++it){
+    --i;
+    ASSERT_EQ(*it, static_cast<int>(i));
+  }
+  ASSERT_EQ(i, 0u);
+
+  // the mutable reverse iterator writes through to the storage
+  *a.rbegin() = 99;
+  ASSERT_EQ(a.back(), 99);
+  std::reverse(a.rbegin(), a.rend());
+  ASSERT_EQ(a.front(), 99);
 }
 
 
@@ -1235,6 +1378,210 @@ TEST(vector, insert_erase_non_trivial)
     ASSERT_EQ(B::destroyed, 11u);
     for(size_t i = 0; i < 5; ++i)  ASSERT_EQ(a[i].value(), static_cast<int>(i));
     for(size_t i = 5; i < 90; ++i) ASSERT_EQ(a[i].value(), static_cast<int>(i + 10));
+  }
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
+}
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Comparison
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * Orderable by < alone, with no operator<=>. This is the case synth-three-way
+ * exists for: two calls to < can only justify a weak_ordering, never a strong
+ * one, so vector<LessOnly> must compare weakly even though its elements are a
+ * plain int underneath.
+ */
+struct LessOnly {
+  int v;
+  bool operator==(const LessOnly& o) const { return v == o.v; }
+  bool operator<(const LessOnly& o)  const { return v <  o.v; }
+};
+
+static_assert(!std::three_way_comparable<LessOnly>);
+
+} // namespace
+
+// A defines operator== and nothing else, so the vector must be equality
+// comparable while <=> drops out of overload resolution rather than hard
+// erroring inside lexicographical_compare_three_way
+static_assert(std::equality_comparable<msc::vector<A>>);
+static_assert(!std::three_way_comparable<msc::vector<A>>);
+static_assert(std::equality_comparable<msc::vector<int>>);
+static_assert(std::three_way_comparable<msc::vector<int>>);
+
+// the category is taken from the element type, not fixed by the container
+static_assert(std::same_as<std::compare_three_way_result_t<msc::vector<int>>,
+                           std::strong_ordering>);
+static_assert(std::same_as<std::compare_three_way_result_t<msc::vector<double>>,
+                           std::partial_ordering>);
+static_assert(std::same_as<std::compare_three_way_result_t<msc::vector<LessOnly>>,
+                           std::weak_ordering>);
+
+
+TEST(vector, comparison_equality)
+{
+  msc::vector<int> a {};
+  msc::vector<int> b {};
+  fill(a, TEST_SIZE);
+  fill(b, TEST_SIZE);
+
+  ASSERT_TRUE(a == a);
+  ASSERT_TRUE(a == b);
+  ASSERT_FALSE(a != b);
+
+  // a copy compares equal to its source
+  msc::vector<int> copy = a;
+  ASSERT_TRUE(copy == a);
+
+  // same length, one element apart
+  b[TEST_SIZE / 2] = -1;
+  ASSERT_FALSE(a == b);
+  ASSERT_TRUE(a != b);
+
+  // differing length, common prefix
+  msc::vector<int> shorter {};
+  fill(shorter, TEST_SIZE - 1);
+  ASSERT_FALSE(a == shorter);
+  ASSERT_TRUE(a != shorter);
+
+  // empty compares equal only to empty
+  msc::vector<int> e1 {};
+  msc::vector<int> e2 {};
+  ASSERT_TRUE(e1 == e2);
+  ASSERT_FALSE(e1 == a);
+  ASSERT_TRUE(e1 != a);
+
+  // capacity must not take part: same contents, storage of very different size
+  msc::vector<int> roomy {};
+  roomy.reserve(TEST_SIZE * 16);
+  fill(roomy, TEST_SIZE);
+  ASSERT_NE(roomy.capacity(), a.capacity());
+  ASSERT_TRUE(roomy == a);
+}
+
+
+TEST(vector, comparison_ordering)
+{
+  msc::vector<int> a {};
+  msc::vector<int> b {};
+  fill(a, TEST_SIZE);
+  fill(b, TEST_SIZE);
+
+  ASSERT_TRUE((a <=> b) == std::strong_ordering::equal);
+  ASSERT_FALSE(a < b);
+  ASSERT_FALSE(a > b);
+  ASSERT_TRUE(a <= b);
+  ASSERT_TRUE(a >= b);
+
+  // lexicographic: the first differing element decides, wherever it sits
+  b[TEST_SIZE / 2] = static_cast<int>(TEST_SIZE) * 10;
+  ASSERT_TRUE(a < b);
+  ASSERT_TRUE(b > a);
+  ASSERT_TRUE((a <=> b) == std::strong_ordering::less);
+
+  // a difference early outweighs everything after it
+  msc::vector<int> c {};
+  fill(c, TEST_SIZE);
+  c[0] = -1;
+  ASSERT_TRUE(c < a);
+
+  // a prefix is less than the sequence that extends it, which a comparison
+  // that looked at size first would get backwards
+  msc::vector<int> prefix {};
+  fill(prefix, TEST_SIZE - 1);
+  ASSERT_TRUE(prefix < a);
+  ASSERT_TRUE(a > prefix);
+  ASSERT_TRUE((prefix <=> a) == std::strong_ordering::less);
+
+  // ...but a shorter sequence still wins on a larger leading element
+  msc::vector<int> big_short {};
+  big_short.emplace_back(static_cast<int>(TEST_SIZE) * 100);
+  ASSERT_TRUE(big_short > a);
+
+  // empty is less than anything non empty and equal to another empty
+  msc::vector<int> e {};
+  ASSERT_TRUE(e < a);
+  ASSERT_TRUE((e <=> msc::vector<int>{}) == std::strong_ordering::equal);
+}
+
+
+TEST(vector, comparison_synth_three_way)
+{
+  // LessOnly has no <=>, so ordering has to go through the synthesized path
+  msc::vector<LessOnly> a {};
+  msc::vector<LessOnly> b {};
+  for(int i = 0; i < 8; ++i){
+    a.emplace_back(i);
+    b.emplace_back(i);
+  }
+
+  static_assert(std::same_as<decltype(a <=> b), std::weak_ordering>);
+
+  ASSERT_TRUE((a <=> b) == std::weak_ordering::equivalent);
+  ASSERT_TRUE(a == b);
+
+  b[4] = LessOnly{100};
+  ASSERT_TRUE((a <=> b) == std::weak_ordering::less);
+  ASSERT_TRUE(a < b);
+  ASSERT_TRUE(b > a);
+  ASSERT_FALSE(a == b);
+
+  msc::vector<LessOnly> prefix {};
+  for(int i = 0; i < 7; ++i) prefix.emplace_back(i);
+  ASSERT_TRUE(prefix < a);
+}
+
+
+TEST(vector, comparison_partial_ordering)
+{
+  // double is only partially ordered, and the container has to pass that
+  // through rather than flattening it to strong_ordering
+  msc::vector<double> a {};
+  msc::vector<double> b {};
+  a.emplace_back(1.0);
+  b.emplace_back(std::numeric_limits<double>::quiet_NaN());
+
+  static_assert(std::same_as<decltype(a <=> b), std::partial_ordering>);
+
+  ASSERT_TRUE((a <=> b) == std::partial_ordering::unordered);
+  ASSERT_FALSE(a < b);
+  ASSERT_FALSE(a > b);
+  ASSERT_FALSE(a == b);
+}
+
+
+TEST(vector, comparison_non_trivial)
+{
+  // comparison reads the elements and must neither construct nor destroy any
+  B::reset();
+  {
+    msc::vector<B> a {};
+    msc::vector<B> b {};
+    fill(a, 64);
+    fill(b, 64);
+
+    const size_t built_before     = B::constructed;
+    const size_t destroyed_before = B::destroyed;
+
+    const msc::vector<B>& ca = a;
+    const msc::vector<B>& cb = b;
+    ASSERT_TRUE(ca == cb);
+
+    ASSERT_EQ(B::constructed, built_before);
+    ASSERT_EQ(B::destroyed, destroyed_before);
+    ASSERT_EQ(B::live, 128u);
+
+    b[32] = B{999};
+    ASSERT_FALSE(ca == cb);
+
+    msc::vector<B> shorter {};
+    fill(shorter, 63);
+    ASSERT_FALSE(ca == shorter);
   }
   ASSERT_EQ(B::live, 0u);
   ASSERT_EQ(B::destroyed, B::constructed);
