@@ -73,11 +73,20 @@ private:
 
 
   /**
-   * Grows the vector by the factor size_multiplier
+   * Grows the vector by the factor size_multiplier.
+   *
+   * The factor applies to bytes, so the result has to be converted back to an
+   * element count, and that division truncates. Once sizeof(T) reaches a
+   * quarter of the current capacity the truncation swallows the entire
+   * increment and the call becomes a no op, leaving the caller to construct
+   * into a page that was never mapped. Flooring the target one page above the
+   * current mapping keeps every call moving; it only binds while the vector is
+   * small, so the growth factor is unchanged once 25% exceeds a page.
    */
   void grow(){
-    std::size_t new_capacity = static_cast<std::size_t>(static_cast<double>(capacity_) * size_multiplier);
-    grow(new_capacity / sizeof(T));
+    std::size_t target = static_cast<std::size_t>(static_cast<double>(capacity_) * size_multiplier);
+    if(target < capacity_ + PAGE_SIZE) target = capacity_ + PAGE_SIZE;
+    grow(roundup(target, sizeof(T)) / sizeof(T));
   }
 
 
@@ -425,11 +434,25 @@ public:
   iterator erase(iterator pos){
     return erase(pos, pos + 1);
   }
-  void push_back(const T& val){
-    if((size_+1)*sizeof(T) > capacity_) grow();
-    data()[size_] = val;
-    size_++;
-  }
+  /**
+   * Both overloads defer to emplace_back, which constructs into the slot.
+   * Assigning instead would run operator= on storage no object lives in yet,
+   * which is undefined and crashes outright for any type whose assignment
+   * reads its own state before overwriting it.
+   *
+   * push_back(const T&) copies, so it needs a copy constructor. It is a non
+   * template member, so it is only instantiated where it is called: a move only
+   * T is fine as long as callers stay on the rvalue overload, and asking for the
+   * copy is a compile error at the call site rather than anything at runtime.
+   *
+   * Passing an element of this same vector is safe, which std::vector cannot
+   * promise. Growing is an mprotect over a mapping reserved up front, so the
+   * storage never moves and val is still live when the copy runs; a reallocating
+   * vector would have destroyed it first. This holds for the growth path only,
+   * splice() relocates with mremap and insert()/erase() shift with memmove.
+   */
+  void push_back(const T& val){ emplace_back(val); }
+  void push_back(T&& val){ emplace_back(std::move(val)); }
     
   template <class... Args>
   T& emplace_back(Args&&... a) {

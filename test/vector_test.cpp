@@ -12,6 +12,7 @@
 #include <compare>
 #include <ranges>
 #include <limits>
+#include <memory>
 
 struct A {
   int a;
@@ -767,6 +768,84 @@ TEST(vector, reserve)
 }
 
 
+namespace {
+
+/**
+ * An element large enough that the implicit growth factor has to be handled in
+ * element counts rather than bytes. Filled with a byte pattern derived from the
+ * index so a relocation that loses or duplicates an element is visible.
+ */
+template<size_t N>
+struct Pad {
+  char pad[N];
+  explicit Pad(size_t i){ std::memset(pad, static_cast<int>(i & 0xFF), N); }
+  bool operator==(const Pad& o) const { return std::memcmp(pad, o.pad, N) == 0; }
+};
+
+/**
+ * Grows a default constructed vector one element at a time. The growth factor
+ * is applied to a byte capacity and converted back to an element count, and
+ * that division truncates: once sizeof(T) reaches a quarter of the current
+ * capacity the increment rounds away to nothing and the vector hands out a slot
+ * in a page it never mapped. A default constructed vector starts at one page,
+ * so anything from PAGE_SIZE/2 up used to fault on the first growth.
+ */
+template<size_t N>
+void check_growth(){
+  constexpr size_t count = 24;
+  msc::vector<Pad<N>> v;
+
+  for(size_t i = 0; i < count; ++i){
+    v.emplace_back(i);
+    ASSERT_GE(v.capacity(), v.size()) << "sizeof(T) " << N << " at " << i;
+  }
+  ASSERT_EQ(v.size(), count);
+  for(size_t i = 0; i < count; ++i){
+    ASSERT_EQ(v[i], Pad<N>{i}) << "sizeof(T) " << N << " at " << i;
+  }
+
+  // push_back reaches the same growth path
+  msc::vector<Pad<N>> w;
+  for(size_t i = 0; i < count; ++i){
+    Pad<N> e{i};
+    w.push_back(e);
+  }
+  ASSERT_EQ(w.size(), count);
+  for(size_t i = 0; i < count; ++i){
+    ASSERT_EQ(w[i], Pad<N>{i}) << "sizeof(T) " << N << " at " << i;
+  }
+}
+
+} // namespace
+
+
+TEST(vector, growth_large_elements)
+{
+  // straddles PAGE_SIZE/2, where the truncation starts swallowing the increment
+  check_growth<64>();
+  check_growth<512>();
+  check_growth<1024>();
+  check_growth<PAGE_SIZE / 2>();
+  check_growth<PAGE_SIZE>();
+  check_growth<PAGE_SIZE * 2>();
+}
+
+
+TEST(vector, growth_is_monotonic)
+{
+  // every grow() has to enlarge the mapping. a call that returns without
+  // changing the capacity leaves the next element without storage
+  msc::vector<Pad<PAGE_SIZE>> v;
+  size_t last = v.capacity();
+  for(size_t i = 0; i < 16; ++i){
+    v.emplace_back(i);
+    ASSERT_GE(v.capacity(), v.size());
+    ASSERT_GE(v.capacity(), last);
+    last = v.capacity();
+  }
+}
+
+
 //----------------------------------------------------------------------------------------------------------------------------------------------------
 //    Modifiers
 //----------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1070,6 +1149,166 @@ TEST(vector, splice_edge_cases)
 //----------------------------------------------------------------------------------------------------------------------------------------------------
 //    Object lifetime, with a type the vector cannot treat as raw bytes
 //----------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * Separates a copy from a move, which B cannot: B has no move constructor, so
+ * it cannot show which push_back overload was picked.
+ */
+struct Tracked {
+  static inline size_t copies = 0;
+  static inline size_t moves  = 0;
+  static void reset(){ copies = 0; moves = 0; }
+
+  int v;
+  explicit Tracked(int i) : v(i) {}
+  Tracked(const Tracked& o) : v(o.v) { ++copies; }
+  Tracked(Tracked&& o) noexcept : v(o.v) { ++moves; }
+};
+
+} // namespace
+
+
+TEST(vector, push_back_non_trivial)
+{
+  // push_back has to construct into the slot. assigning instead would run
+  // operator= over storage holding no object, and B's assignment writes through
+  // a payload pointer that is still whatever the fresh mapping contained
+  B::reset();
+  {
+    msc::vector<B> a {};
+    const size_t n = 200;
+
+    for(size_t i = 0; i < n; ++i){
+      B src{i};
+      a.push_back(src);
+    }
+
+    ASSERT_EQ(a.size(), n);
+    // one construction for each source and one for each element copied from it
+    ASSERT_EQ(B::constructed, n * 2);
+    ASSERT_EQ(B::live, n);
+    for(size_t i = 0; i < n; ++i){
+      ASSERT_EQ(a[i].value(), static_cast<int>(i));
+    }
+
+    // and it has to keep working once the storage has grown
+    grow_once(a);
+    for(size_t i = 0; i < n; ++i){
+      ASSERT_EQ(a[i].value(), static_cast<int>(i));
+    }
+  }
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
+}
+
+
+TEST(vector, push_back_moves_rvalue)
+{
+  Tracked::reset();
+  msc::vector<Tracked> a {};
+
+  Tracked lvalue{1};
+  a.push_back(lvalue);
+  ASSERT_EQ(Tracked::copies, 1u);
+  ASSERT_EQ(Tracked::moves, 0u);
+
+  a.push_back(Tracked{2});
+  ASSERT_EQ(Tracked::copies, 1u);
+  ASSERT_EQ(Tracked::moves, 1u);
+
+  a.push_back(std::move(lvalue));
+  ASSERT_EQ(Tracked::copies, 1u);
+  ASSERT_EQ(Tracked::moves, 2u);
+
+  ASSERT_EQ(a.size(), 3u);
+  ASSERT_EQ(a[0].v, 1);
+  ASSERT_EQ(a[1].v, 2);
+  ASSERT_EQ(a[2].v, 1);
+}
+
+
+TEST(vector, push_back_self_reference)
+{
+  // growing is an mprotect over a mapping reserved up front, so the storage
+  // never moves and a reference into the vector survives it. std::vector cannot
+  // promise this: reallocating would destroy the referenced element before the
+  // copy runs. the loop crosses at least one growth boundary on purpose
+  msc::vector<int> a {};
+  a.emplace_back(7);
+
+  const int* base = a.data();
+  const size_t start = a.capacity();
+  while(a.capacity() == start){
+    a.push_back(a[0]);
+  }
+  // and once more now that the capacity has already changed
+  a.push_back(a[0]);
+  a.push_back(a.back());
+
+  ASSERT_GT(a.capacity(), start);
+  // the mechanism that makes it safe: the mapping stayed where it was
+  ASSERT_EQ(a.data(), base);
+  ASSERT_GT(a.size(), 1u);
+  for(size_t i = 0; i < a.size(); ++i){
+    ASSERT_EQ(a[i], 7) << "at " << i;
+  }
+
+  // the same through the non trivial type, where a stale reference would mean
+  // copying from a destroyed payload rather than reading a stale int
+  B::reset();
+  {
+    msc::vector<B> b {};
+    b.emplace_back(42);
+
+    const size_t b_start = b.capacity();
+    while(b.capacity() == b_start){
+      b.push_back(b[0]);
+    }
+    b.push_back(b[0]);
+
+    ASSERT_GT(b.capacity(), b_start);
+    for(size_t i = 0; i < b.size(); ++i){
+      ASSERT_EQ(b[i].value(), 42) << "at " << i;
+    }
+    ASSERT_EQ(B::live, b.size());
+  }
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
+}
+
+
+TEST(vector, push_back_move_only_element)
+{
+  // push_back(const T&) is a non template member, so it is only instantiated
+  // where it is called. a T with no copy constructor is therefore fine as long
+  // as callers stay on the rvalue overload, exactly as with std::vector
+  static_assert(!std::copy_constructible<std::unique_ptr<int>>);
+  static_assert(std::move_constructible<std::unique_ptr<int>>);
+
+  msc::vector<std::unique_ptr<int>> v {};
+  v.emplace_back(new int(1));
+  v.push_back(std::make_unique<int>(2));
+
+  auto p = std::make_unique<int>(3);
+  v.push_back(std::move(p));
+  ASSERT_EQ(p, nullptr);
+
+  ASSERT_EQ(v.size(), 3u);
+  ASSERT_EQ(*v[0], 1);
+  ASSERT_EQ(*v[1], 2);
+  ASSERT_EQ(*v[2], 3);
+
+  // and it keeps working across a growth
+  for(int i = 0; i < 4096; ++i){
+    v.push_back(std::make_unique<int>(i));
+  }
+  ASSERT_EQ(v.size(), 4099u);
+  ASSERT_EQ(*v[0], 1);
+  ASSERT_EQ(*v.back(), 4095);
+}
+
 
 TEST(vector, non_trivial_lifetime)
 {
