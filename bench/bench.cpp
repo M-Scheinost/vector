@@ -27,7 +27,7 @@ void splice_vectors(std::vector<T>& a, std::vector<T>& b){
 }
 
 void bench_splice(std::size_t max_size){
-PerfEvent e;
+  PerfEvent e;
   {
     e.setParam("method", "splice");
     
@@ -54,6 +54,38 @@ PerfEvent e;
       PerfEventBlock block (e, i);
       splice_vectors(a, b);
     }
+  }
+}
+
+void bench_splice_multi(std::size_t reps, std::size_t count, std::size_t size){
+  PerfEvent e;
+
+  for(std::size_t r = 0; r < reps; ++r){
+    e.setParam("method", "one-by-one");
+    std::vector<msc::vector<int>> parts(count);
+    for(size_t k = 0; k < parts.size(); ++k){
+      fill_vector(parts[k], size);
+    }
+    msc::vector<int> a;
+    fill_vector(a,size);
+    
+    PerfEventBlock block (e);
+    for(std::size_t i = 0; i < count; ++i){
+      splice_vectors(a, parts[i]);
+    }
+  }
+  
+  for(std::size_t r = 0; r < reps;++r){
+    e.setParam("method", "together");
+    std::vector<msc::vector<int>> parts(count);
+    for(size_t k = 0; k < parts.size(); ++k){
+      fill_vector(parts[k], size);
+    }
+    msc::vector<int> a;
+    fill_vector(a,size);
+    
+    PerfEventBlock block (e);
+    a.splice_range(parts);
   }
 }
 
@@ -84,6 +116,7 @@ void bench_fill(std::size_t max_size){
 }
 
 int main(){
-  std::size_t test_size = 1ull << 32;
-  bench_splice(test_size);
+  std::size_t test_size = (1ull << 20) + 1011;
+  std::size_t reps = 10;
+  bench_splice_multi(reps, 20, test_size);
 }

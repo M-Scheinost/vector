@@ -13,6 +13,7 @@
 #include <initializer_list>
 #include <compare>
 #include <concepts>
+#include <span>
 
 
 
@@ -90,7 +91,16 @@ private:
   }
 
 
+  /**
+   * Every path that can enlarge the vector ends up here, so this is the one
+   * place the max_size() limit has to be enforced. Beyond conforming to what
+   * std::vector promises, the check is what keeps capacity_bytes() safe: it
+   * multiplies by sizeof(T), and that product can only overflow for a count
+   * this rejects.
+   */
   void grow(std::size_t new_cap){
+    if(new_cap > max_size()) throw std::length_error("vector::grow: size exceeds max_size()");
+
     std::size_t new_capacity = capacity_bytes(new_cap);
     if(capacity_ >= new_capacity) return;
 
@@ -98,6 +108,18 @@ private:
     if (success) throw std::bad_alloc{};
     capacity_ = new_capacity;
     }
+
+
+  /**
+   * The element count this vector would reach by adding n more, or a throw if
+   * that exceeds max_size(). Written as a subtraction because size_ + n is
+   * exactly the sum that could wrap, which would turn an impossible request
+   * into a small and apparently valid one.
+   */
+  std::size_t checked_total(std::size_t n) const {
+    if(n > max_size() - size_) throw std::length_error("vector: size exceeds max_size()");
+    return size_ + n;
+  }
 
 
     /**
@@ -152,6 +174,17 @@ private:
 
 
   /**
+   * Runs every element's destructor and empties the vector without touching the
+   * mapping. clear() releases the pages on top of this; assign() must not, since
+   * it refills immediately and dropping the pages would only fault them back in.
+   */
+  void destroy_all() noexcept {
+    std::destroy_n(data(), size_);
+    size_ = 0;
+  }
+
+
+  /**
    * Opens a gap of n uninitialized slots at index idx and hands the first of
    * them to construct, which has to fill exactly n. The elements from idx
    * onwards are relocated bitwise, as everywhere else in this class.
@@ -162,7 +195,7 @@ private:
   template<class F>
   T* insert_n(std::size_t idx, std::size_t n, F&& construct){
     if(n == 0) return data() + idx;
-    grow(size_ + n);
+    grow(checked_total(n));
 
     std::byte* from = data_ + idx * sizeof(T);
     const std::size_t tail_bytes = (size_ - idx) * sizeof(T);
@@ -216,6 +249,135 @@ private:
     other.init();
   }
 
+
+  /**
+   * How a single source is going to be consumed by splice_all.
+   *
+   * body is the leading run of bytes that sits on a stride boundary and can be
+   * handed to mremap; tail is whatever is left over and has to be copied. A
+   * source small enough for COPY_LIMIT, or shorter than one whole stride, is
+   * all tail: the syscall would cost more than the copy it saves.
+   */
+  struct source_split {
+    std::size_t body;
+    std::size_t tail;
+  };
+
+  static constexpr source_split  split_source(std::size_t bytes){
+    constexpr std::size_t stride = std::lcm(sizeof(T), PAGE_SIZE);
+    if(bytes <= COPY_LIMIT) return {0, bytes};
+    const std::size_t body = rounddown(bytes, stride);
+    return {body, bytes - body};
+  }
+
+
+  /**
+   * Merges many vectors in one pass.
+   *
+   * Splicing k sources one at a time keeps re-handling this vector's unaligned
+   * spill: every step lifts it into a scratch buffer, mremaps the source over
+   * where it sat, and writes it back, so those bytes are copied twice per
+   * source. Doing it once for all k sources needs a single split: every source
+   * contributes a stride aligned body that mremap can relocate for free, and a
+   * leftover tail that has to be copied.
+   *
+   * The final position of every tail is known before anything moves, because
+   * the bodies' total size is known. So each tail goes straight there, copied
+   * exactly once, with no staging buffer in between. Only this vector's own
+   * spill has to move before the first mremap lands on it, and it too goes
+   * directly to its final place.
+   *
+   * The layout that falls out is
+   *     [ this' body ][ body 1 ]..[ body k ][ this' spill ][ tail 1 ]..[ tail k ]
+   * so, as with splice(), ORDER IS NOT PRESERVED. When nothing can be mapped
+   * the sources are simply appended and the order does survive.
+   *
+   * The span is walked three times, so it has to be stable across the call, and
+   * naming the same vector twice or naming this one is not allowed.
+   */
+  void splice_all(std::span<vector* const> sources){
+    constexpr std::size_t stride = std::lcm(sizeof(T), PAGE_SIZE);
+
+    const std::size_t size_bytes = size_ * sizeof(T);
+    const std::size_t first_body     = rounddown(size_bytes, stride);
+    const std::size_t first_spill    = size_bytes - first_body;
+
+    // ---- measure, before anything is touched ----
+    // alongside the sizes this costs both strategies in bytes copied, because
+    // batching is not always the cheaper one. mremap carries a source's tail
+    // along for free when the whole mapping moves, which is what the pairwise
+    // form does; batching gives that up to keep the bodies adjacent, and pays
+    // for it once per source. Which way that goes depends entirely on how close
+    // the sources are to a stride boundary, so it is measured rather than assumed
+    std::size_t added         = 0;
+    std::size_t body_total    = 0;
+
+    for(vector* s : sources){
+      if(s == nullptr || s == this || s->size_ == 0) continue;
+      if(s->size_ > max_size() - size_ - added)
+        throw std::length_error("vector::splice_all: size exceeds max_size()");
+      added += s->size_;
+
+      const std::size_t bytes = s->size_ * sizeof(T);
+      const source_split sp   = split_source(bytes);
+      body_total += sp.body;
+    }
+    if(added == 0) return;
+
+    // can throw, and nothing has been modified yet
+    grow(size_ + added);
+
+    // where the bodies start, and where everything copied lands behind them
+    std::size_t body_cursor = body_total ? first_body : size_bytes;
+    std::size_t tail_cursor = body_cursor + body_total;
+
+    // this vector's spill is the one run that the first mremap would land on,
+    // so it moves first. memmove because the two can overlap when the bodies
+    // together are shorter than the spill itself
+    if(body_total && first_spill){
+      std::memmove(data_ + tail_cursor, data_ + first_body, first_spill);
+      tail_cursor += first_spill;
+    }
+
+    for(vector* s : sources){
+      if(s == nullptr || s == this || s->size_ == 0) continue;
+      const source_split sp = split_source(s->size_ * sizeof(T));
+
+      if(sp.body){
+        // only the body is handed to mremap, so the tail stays put in the
+        // source's mapping and can be read afterwards. passing the whole
+        // mapping would have the kernel drop everything past the new size
+        void* p = mremap(static_cast<void*>(s->data_), sp.body, sp.body,
+                         MREMAP_MAYMOVE | MREMAP_FIXED,
+                         static_cast<void*>(data_ + body_cursor));
+        if(p == MAP_FAILED) throw std::bad_alloc{};
+        body_cursor += sp.body;
+      }
+
+      // one copy, straight to the place this tail keeps
+      if(sp.tail){
+        std::memcpy(data_ + tail_cursor, s->data_ + sp.body, sp.tail);
+        tail_cursor += sp.tail;
+      }
+
+      if(sp.body){
+        // the prefix was moved out from under it; this releases what is left,
+        // including the reservation beyond the source's live capacity
+        munmap(s->data_ + sp.body, max_capacity_ - sp.body);
+        s->data_     = nullptr;
+        s->size_     = 0;
+        s->capacity_ = PAGE_SIZE;
+        s->init();
+      } else {
+        // the bytes now live here, so the source's storage holds no object
+        std::memset(s->data_, 0, s->size_ * sizeof(T));
+        s->size_ = 0;
+      }
+    }
+
+    size_ += added;
+  }
+
 public:
 
 //----------------------------------------------------------------------------------------------------------------------------------------------------
@@ -237,9 +399,29 @@ public:
     init();
   }
 
-  explicit vector(size_type size){
-    capacity_ = capacity_bytes(size);
-    init();
+  explicit vector(size_type count) : vector() {
+    grow(count);
+    std::uninitialized_value_construct_n(data(), count);
+    size_ = count;
+  }
+
+  vector(size_type count, const T& value) : vector() {
+    grow(count);
+    std::uninitialized_fill_n(data(), count, value);
+    size_ = count;
+  }
+
+  template<std::input_iterator It>
+  vector(It first, It last) : vector() {
+    append_range(std::ranges::subrange(first, last));
+  }
+
+  vector(std::initializer_list<T> il) : vector(il.begin(), il.end()) {}
+
+  template<std::ranges::input_range R>
+    requires std::convertible_to<std::ranges::range_reference_t<R>, T>
+  vector(std::from_range_t, R&& rg) : vector() {
+    append_range(std::forward<R>(rg));
   }
 
   vector(const vector& other) : capacity_(other.capacity_) {
@@ -294,9 +476,49 @@ public:
     return *this;
   }
 
+  vector& operator=(std::initializer_list<T> il){
+    assign(il);
+    return *this;
+  }
+
   ~vector(){
     std::destroy_n(data(), size_);
     if(data_) munmap(data_, max_capacity_);
+  }
+
+  /**
+   * Replaces the contents. grow() only ever enlarges, so assigning something
+   * smaller keeps the capacity that was already there, as std::vector does.
+   */
+  void assign(size_type count, const T& value){
+    // grow first: it is the step that can throw, and it only ever enlarges the
+    // mapping without touching an element, so a request that is refused leaves
+    // the vector exactly as it was rather than emptied
+    grow(count);
+    destroy_all();
+    std::uninitialized_fill_n(data(), count, value);
+    size_ = count;
+  }
+
+  template<std::input_iterator It>
+  void assign(It first, It last){
+    assign_range(std::ranges::subrange(first, last));
+  }
+
+  void assign(std::initializer_list<T> il){ assign(il.begin(), il.end()); }
+
+  template<std::ranges::input_range R>
+    requires std::convertible_to<std::ranges::range_reference_t<R>, T>
+  void assign_range(R&& rg){
+    // where the length is knowable, take the bounds check and the mapping
+    // before destroying anything, so an oversized range is refused with the
+    // vector intact. a single pass range cannot be measured without consuming
+    // it, so there the old contents are gone before the append can fail
+    if constexpr (std::ranges::forward_range<R> || std::ranges::sized_range<R>){
+      grow(static_cast<size_type>(std::ranges::distance(rg)));
+    }
+    destroy_all();
+    append_range(std::forward<R>(rg));
   }
 
 //----------------------------------------------------------------------------------------------------------------------------------------------------
@@ -342,8 +564,7 @@ public:
   size_type size() const { return size_; }
   constexpr size_type max_size() const {return max_capacity_ / sizeof(T);}
   void reserve(size_type new_cap){
-    if((new_cap*sizeof(T)) > capacity_)
-      grow(new_cap);
+    grow(new_cap);
   }
   size_type capacity() const {return capacity_ / sizeof(T);}
   void shrink_to_fit(){shrink();}
@@ -351,7 +572,7 @@ public:
 //    Modifiers
 //----------------------------------------------------------------------------------------------------------------------------------------------------
   void clear (){
-    std::destroy_n(data(), size_);
+    destroy_all();
     int success = madvise(data_, capacity_, MADV_DONTNEED);
     if(success) throw std::bad_alloc{};
     // success = mprotect(data_, capacity_, PROT_NONE);
@@ -361,56 +582,47 @@ public:
     size_ = 0;
     // capacity_ = PAGE_SIZE;
   }
-  /**
-   * Inserts before pos and returns an iterator to the first element inserted.
-   * Order is preserved: everything from pos onwards moves up, which makes these
-   * linear in the number of elements after pos. splice() stays the one
-   * operation in this class that is allowed to reorder.
-   *
-   * Growing uses mprotect and never relocates the mapping, so pos survives the
-   * growth; it is the shifting that moves elements, not the reallocation.
-   */
-  iterator insert(iterator pos, const T& value){
-    return insert_n(pos - begin(), 1, [&](T* p){ ::new (p) T(value); });
+
+
+  iterator insert(const_iterator pos, const T& value){
+    return insert_n(pos - cbegin(), 1, [&](T* p){ ::new (p) T(value); });
   }
 
-  iterator insert(iterator pos, T&& value){
-    return insert_n(pos - begin(), 1, [&](T* p){ ::new (p) T(std::move(value)); });
+
+  iterator insert(const_iterator pos, T&& value){
+    return insert_n(pos - cbegin(), 1, [&](T* p){ ::new (p) T(std::move(value)); });
   }
 
-  iterator insert(iterator pos, size_type count, const T& value){
-    return insert_n(pos - begin(), count,
+
+  iterator insert(const_iterator pos, size_type count, const T& value){
+    return insert_n(pos - cbegin(), count,
                     [&](T* p){ std::uninitialized_fill_n(p, count, value); });
   }
 
+
   template<std::forward_iterator It>
-  iterator insert(iterator pos, It first, It last){
+  iterator insert(const_iterator pos, It first, It last){
     const auto count = static_cast<size_type>(std::distance(first, last));
-    return insert_n(pos - begin(), count,
+    return insert_n(pos - cbegin(), count,
                     [&](T* p){ std::uninitialized_copy(first, last, p); });
   }
 
-  iterator insert(iterator pos, std::initializer_list<T> il){
+  iterator insert(const_iterator pos, std::initializer_list<T> il){
     return insert(pos, il.begin(), il.end());
   }
 
-  /**
-   * Copies every element of rg in before pos. The range has to be sized or
-   * multi pass so the count is known before the gap is opened. To move the
-   * elements out of rg instead of copying them, pass std::views::as_rvalue(rg).
-   */
   template<class R>
     requires std::ranges::forward_range<R> || std::ranges::sized_range<R>
-  iterator insert_range(iterator pos, R&& rg){
+  iterator insert_range(const_iterator pos, R&& rg){
     const auto count = static_cast<size_type>(std::ranges::distance(rg));
-    return insert_n(pos - begin(), count, [&](T* p){
+    return insert_n(pos - cbegin(), count, [&](T* p){
       std::uninitialized_copy_n(std::ranges::begin(rg), count, p);
     });
   }
 
   template<class... Args>
-  iterator emplace(iterator pos, Args&&... args){
-    return insert_n(pos - begin(), 1,
+  iterator emplace(const_iterator pos, Args&&... args){
+    return insert_n(pos - cbegin(), 1,
                     [&](T* p){ ::new (p) T(std::forward<Args>(args)...); });
   }
 
@@ -419,21 +631,24 @@ public:
    * element that took first's place. Destructors are noexcept, so nothing here
    * can fail part way.
    */
-  iterator erase(iterator first, iterator last){
-    const auto idx = static_cast<size_type>(first - begin());
+  iterator erase(const_iterator first, const_iterator last){
+    const auto idx = static_cast<size_type>(first - cbegin());
     const auto n   = static_cast<size_type>(last - first);
-    if(n == 0) return first;
+    // the position is const, so the destruction and the returned iterator both
+    // go through data() rather than through the parameter
+    if(n == 0) return data() + idx;
 
-    std::destroy_n(first, n);
+    std::destroy_n(data() + idx, n);
     std::byte* to = data_ + idx * sizeof(T);
     std::memmove(to, to + n * sizeof(T), (size_ - idx - n) * sizeof(T));
     size_ -= n;
     return data() + idx;
   }
 
-  iterator erase(iterator pos){
+  iterator erase(const_iterator pos){
     return erase(pos, pos + 1);
   }
+
   /**
    * Both overloads defer to emplace_back, which constructs into the slot.
    * Assigning instead would run operator= on storage no object lives in yet,
@@ -463,10 +678,72 @@ public:
     return *slot;
   }
 
-  void append_range();
+  /**
+   * Appends every element of rg.
+   *
+   * Unlike insert_range this accepts a single pass range too. insert_n has to
+   * know the count before it opens the gap, but appending opens no gap: with
+   * nothing after the insertion point the elements can simply be pushed one at
+   * a time. Where the count is known the bulk path still takes it, so a sized
+   * or multi pass range costs one grow and one uninitialized_copy_n.
+   */
+  template<std::ranges::input_range R>
+    requires std::convertible_to<std::ranges::range_reference_t<R>, T>
+  void append_range(R&& rg){
+    if constexpr (std::ranges::forward_range<R> || std::ranges::sized_range<R>){
+      const auto n = static_cast<size_type>(std::ranges::distance(rg));
+      if(n == 0) return;
+      grow(checked_total(n));
+      // size_ is only committed once every element is built, so a throw part
+      // way leaves the vector exactly as it was
+      std::uninitialized_copy_n(std::ranges::begin(rg), n, data() + size_);
+      size_ += n;
+    } else {
+      for(auto&& e : rg) emplace_back(std::forward<decltype(e)>(e));
+    }
+  }
+
   void pop_back(){ --size_; std::destroy_at(data() + size_); }
-  void resize();
-  void swap();
+
+  /**
+   * Both overloads leave the capacity alone when they shrink. Releasing the
+   * pages is shrink_to_fit's job, and the private shrink() that does it only
+   * looks like this operation.
+   */
+  void resize(size_type count){
+    if(count < size_){
+      std::destroy_n(data() + count, size_ - count);
+      size_ = count;
+    } else if(count > size_){
+      grow(count);
+      std::uninitialized_value_construct_n(data() + size_, count - size_);
+      size_ = count;
+    }
+  }
+
+  void resize(size_type count, const T& value){
+    if(count < size_){
+      std::destroy_n(data() + count, size_ - count);
+      size_ = count;
+    } else if(count > size_){
+      grow(count);
+      std::uninitialized_fill_n(data() + size_, count - size_, value);
+      size_ = count;
+    }
+  }
+
+  /**
+   * Every vector owns an independent mapping, so this exchanges three scalars
+   * and never touches an element. There is no allocator to propagate, which is
+   * what makes it unconditionally noexcept.
+   */
+  void swap(vector& other) noexcept {
+    std::swap(data_,     other.data_);
+    std::swap(size_,     other.size_);
+    std::swap(capacity_, other.capacity_);
+  }
+
+  friend void swap(vector& a, vector& b) noexcept { a.swap(b); }
 
   /**
    * Merges two vectors into one.
@@ -475,13 +752,48 @@ public:
   void splice(vector<T>&& other){
     if(this == &other || other.size_ == 0) return;
     
-    grow(size_ + other.size_);
+    grow(checked_total(other.size_));
     
     if(other.size_ * sizeof(T) <= COPY_LIMIT){
       splice_copy(other);
     }else{
       splice_move(other);
     }
+  }
+
+  /**
+   * Merges any number of vectors in at once.
+   * ORDER IS NOT PRESERVED, as with the two vector form.
+   *
+   * Prefer this over splicing one at a time: the pairwise form re-copies this
+   * vector's unaligned tail on every step, while this copies each unmappable
+   * byte exactly once no matter how many sources there are.
+   *
+   * The sources have to be distinct from each other and from this vector.
+   */
+  template<std::same_as<vector>... Vs>
+    requires (sizeof...(Vs) > 0)
+  void splice(Vs&&... others){
+    vector* ptrs[] = { (&others)... };
+    splice_all(std::span<vector* const>{ptrs, sizeof...(Vs)});
+  }
+
+  /**
+   * The same, for a number of sources only known at run time. Takes any range
+   * of vectors, for instance a std::vector<msc::vector<T>> of partial results.
+   */
+  template<std::ranges::input_range R>
+    requires std::same_as<std::remove_cvref_t<std::ranges::range_reference_t<R>>, vector>
+  void splice_range(R&& sources){
+    std::size_t n = 0;
+    for(auto&& s : sources){ (void)s; ++n; }
+    if(n == 0) return;
+
+    auto ptrs = std::make_unique_for_overwrite<vector*[]>(n);
+    std::size_t i = 0;
+    for(auto&& s : sources) ptrs[i++] = std::addressof(s);
+
+    splice_all(std::span<vector* const>{ptrs.get(), n});
   }
 
 //----------------------------------------------------------------------------------------------------------------------------------------------------
@@ -514,6 +826,43 @@ public:
   }
 };
 
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Deduction guides
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+template<std::input_iterator It>
+vector(It, It) -> vector<typename std::iterator_traits<It>::value_type>;
+
+template<std::ranges::input_range R>
+vector(std::from_range_t, R&&) -> vector<std::ranges::range_value_t<R>>;
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Non member erase
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The free erase / erase_if the standard added in C++20, which collapse the
+ * remove-erase idiom into one call and return how many elements went. They live
+ * in namespace msc and are found by argument dependent lookup, so an unqualified
+ * erase(v, 3) resolves to them without a using declaration.
+ */
+template<class T, class U = T>
+typename vector<T>::size_type erase(vector<T>& c, const U& value){
+  auto it = std::remove(c.begin(), c.end(), value);
+  const auto removed = static_cast<typename vector<T>::size_type>(c.end() - it);
+  c.erase(it, c.end());
+  return removed;
+}
+
+template<class T, class Pred>
+typename vector<T>::size_type erase_if(vector<T>& c, Pred pred){
+  auto it = std::remove_if(c.begin(), c.end(), pred);
+  const auto removed = static_cast<typename vector<T>::size_type>(c.end() - it);
+  c.erase(it, c.end());
+  return removed;
+}
 
 
 } // namespace msc
