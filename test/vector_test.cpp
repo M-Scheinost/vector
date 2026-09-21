@@ -1,5 +1,5 @@
 #include "gtest/gtest.h"
-#include "./vector.hpp"
+#include <msc/vector.hpp>
 
 
 
@@ -13,6 +13,13 @@
 #include <ranges>
 #include <limits>
 #include <memory>
+#include <stdexcept>
+#include <unordered_set>
+#include <unordered_map>
+#include <set>
+#include <map>
+#include <list>
+#include <string>
 
 struct A {
   int a;
@@ -1238,8 +1245,8 @@ TEST(vector, splice_threshold_boundary)
 
 TEST(vector, splice_leaves_source_empty_and_usable)
 {
-  // the copy path keeps the source's mapping and the move path gives it a
-  // fresh one, but either way it has to come back as a valid empty vector
+  // the copy path keeps the source's mapping and the move path leaves it
+  // owning none, but either way it has to come back as a valid empty vector
   for(size_t n : {TEST_SIZE, move_path_count<int>()}){
     msc::vector<int> a {};
     msc::vector<int> b {};
@@ -1250,8 +1257,8 @@ TEST(vector, splice_leaves_source_empty_and_usable)
 
     ASSERT_EQ(b.size(), 0u)        << "n " << n;
     ASSERT_TRUE(b.empty())         << "n " << n;
-    ASSERT_NE(b.data(), nullptr)   << "n " << n;
     ASSERT_EQ(b.begin(), b.end())  << "n " << n;
+    ASSERT_LE(b.size(), b.capacity()) << "n " << n;
 
     fill(b, 10);
     ASSERT_EQ(b.size(), 10u) << "n " << n;
@@ -1866,8 +1873,11 @@ TEST(vector, erase_single_and_range)
 
 TEST(vector, insert_erase_non_trivial)
 {
-  // every inserted element is constructed exactly once and every erased one
-  // destroyed exactly once, which is what a wrong shift length would break
+  // B is not trivially copyable, so the shift runs its own copy operations
+  // rather than moving bytes. A wrong shift would leak an element or destroy
+  // one twice, and either shows up as the live count drifting away from the
+  // size. How many temporaries a shift uses along the way does not matter,
+  // only that each is destroyed again
   B::reset();
   {
     msc::vector<B> a {};
@@ -1876,21 +1886,18 @@ TEST(vector, insert_erase_non_trivial)
 
     a.emplace(a.begin() + 10, 999);
     ASSERT_EQ(a.size(), 101u);
-    ASSERT_EQ(B::live, 101u);
+    ASSERT_EQ(B::live, a.size());
     ASSERT_EQ(a[10].value(), 999);
     ASSERT_EQ(a[11].value(), 10);
-    ASSERT_EQ(B::destroyed, 0u);
 
     a.erase(a.begin() + 10);
     ASSERT_EQ(a.size(), 100u);
-    ASSERT_EQ(B::live, 100u);
-    ASSERT_EQ(B::destroyed, 1u);
+    ASSERT_EQ(B::live, a.size());
     ASSERT_EQ(a[10].value(), 10);
 
     a.erase(a.begin() + 5, a.begin() + 15);
     ASSERT_EQ(a.size(), 90u);
-    ASSERT_EQ(B::live, 90u);
-    ASSERT_EQ(B::destroyed, 11u);
+    ASSERT_EQ(B::live, a.size());
     for(size_t i = 0; i < 5; ++i)  ASSERT_EQ(a[i].value(), static_cast<int>(i));
     for(size_t i = 5; i < 90; ++i) ASSERT_EQ(a[i].value(), static_cast<int>(i + 10));
   }
@@ -2561,10 +2568,11 @@ TEST(vector, splice_many_keeps_every_element)
   ASSERT_EQ(dst.size(), want.size());
   ASSERT_EQ(sorted_values(dst), want);
 
-  // every source is emptied and immediately usable again
+  // every source is emptied and immediately usable again. the ones that took
+  // the mremap path own no mapping any more and reserve a new one right here
   for(auto* v : {&a, &b, &c, &d, &e}){
     ASSERT_EQ(v->size(), 0u);
-    ASSERT_NE(v->data(), nullptr);
+    ASSERT_TRUE(v->empty());
     v->emplace_back(7);
     ASSERT_EQ(v->size(), 1u);
     ASSERT_EQ((*v)[0], 7);
@@ -2763,4 +2771,457 @@ TEST(vector, splice_many_respects_max_size)
   // nothing that could exceed max_size() is reachable by building real vectors,
   // so this just pins that the guard is on the batched path at all
   ASSERT_LE(dst.size(), dst.max_size());
+}
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Moved from state
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+// declared noexcept; moving_needs_no_reservation below checks the promise holds.
+// both moves used to give their source a fresh mmap, and an mmap that fails
+// inside a noexcept function is std::terminate, not an exception
+static_assert(std::is_nothrow_move_constructible_v<msc::vector<int>>);
+static_assert(std::is_nothrow_move_assignable_v<msc::vector<int>>);
+static_assert(std::is_nothrow_move_constructible_v<msc::vector<B>>);
+static_assert(std::is_nothrow_move_assignable_v<msc::vector<B>>);
+
+namespace {
+
+/**
+ * Hands f a vector that has just been moved from, so each operation can be
+ * checked against the state a move leaves behind: no mapping at all.
+ */
+template<class F>
+void on_moved_from(F f){
+  msc::vector<int> src{1, 2, 3};
+  msc::vector<int> keep(std::move(src));
+  ASSERT_EQ(keep.size(), 3u);
+  f(src);
+}
+
+} // namespace
+
+
+TEST(vector, moved_from_owns_nothing)
+{
+  msc::vector<int> a{1, 2, 3};
+  msc::vector<int> b(std::move(a));
+  ASSERT_EQ(b.size(), 3u);
+  ASSERT_EQ(b[2], 3);
+
+  // nothing was mapped for the source, so nothing could have failed
+  ASSERT_EQ(a.size(), 0u);
+  ASSERT_TRUE(a.empty());
+  ASSERT_EQ(a.capacity(), 0u);
+  ASSERT_EQ(a.data(), nullptr);
+  ASSERT_EQ(a.begin(), a.end());
+
+  msc::vector<int> c{4, 5};
+  c = std::move(b);
+  ASSERT_EQ(c.size(), 3u);
+  ASSERT_EQ(c[0], 1);
+  ASSERT_EQ(b.capacity(), 0u);
+  ASSERT_EQ(b.data(), nullptr);
+
+  // the elements never moved: the mapping itself changed hands
+  msc::vector<int> d{7, 8, 9};
+  const int* where = d.data();
+  msc::vector<int> e(std::move(d));
+  ASSERT_EQ(e.data(), where);
+}
+
+
+TEST(vector, moved_from_is_fully_usable)
+{
+  // a moved from std::vector is an ordinary empty vector, and callers rely on
+  // that. every block here meets a vector with no mapping at all
+
+  on_moved_from([](msc::vector<int>& v){
+    v.push_back(1);
+    v.emplace_back(2);
+    ASSERT_EQ(v.size(), 2u);
+    ASSERT_EQ(v[1], 2);
+    ASSERT_NE(v.data(), nullptr);        // the reservation was made on demand
+  });
+  on_moved_from([](msc::vector<int>& v){
+    v.reserve(TEST_SIZE);
+    ASSERT_GE(v.capacity(), TEST_SIZE);
+    ASSERT_TRUE(v.empty());
+  });
+  on_moved_from([](msc::vector<int>& v){
+    v.resize(0);
+    ASSERT_TRUE(v.empty());
+    v.resize(5, 9);
+    ASSERT_EQ(v.size(), 5u);
+    ASSERT_EQ(v[4], 9);
+  });
+  on_moved_from([](msc::vector<int>& v){
+    v.insert(v.cbegin(), {1, 2, 3});
+    ASSERT_EQ(v.size(), 3u);
+    ASSERT_EQ(v[0], 1);
+  });
+  on_moved_from([](msc::vector<int>& v){
+    ASSERT_EQ(v.erase(v.cbegin(), v.cend()), v.end());
+    ASSERT_TRUE(v.empty());
+  });
+  on_moved_from([](msc::vector<int>& v){
+    v.assign(4, 1);
+    ASSERT_EQ(v.size(), 4u);
+    v.assign_range(std::views::iota(0, 3));
+    ASSERT_EQ(v.size(), 3u);
+  });
+  on_moved_from([](msc::vector<int>& v){
+    v.append_range(std::views::iota(0, 10));
+    ASSERT_EQ(v.size(), 10u);
+    ASSERT_EQ(v[9], 9);
+  });
+  on_moved_from([](msc::vector<int>& v){
+    // nothing to release, and neither may touch a mapping that is not there
+    ASSERT_NO_THROW(v.clear());
+    ASSERT_NO_THROW(v.shrink_to_fit());
+    ASSERT_EQ(v.capacity(), 0u);
+  });
+  on_moved_from([](msc::vector<int>& v){
+    ASSERT_THROW(v.at(0), std::out_of_range);
+    ASSERT_TRUE(v == msc::vector<int>{});
+    ASSERT_TRUE((v <=> msc::vector<int>{1}) == std::strong_ordering::less);
+  });
+  on_moved_from([](msc::vector<int>& v){
+    // copied from, and copied into
+    msc::vector<int> copy(v);
+    ASSERT_TRUE(copy.empty());
+    copy.push_back(1);
+    ASSERT_EQ(copy.size(), 1u);
+
+    msc::vector<int> full{1, 2, 3};
+    full = v;
+    ASSERT_TRUE(full.empty());
+
+    msc::vector<int> source{4, 5, 6};
+    v = source;
+    ASSERT_EQ(v.size(), 3u);
+    ASSERT_EQ(v[2], 6);
+  });
+  on_moved_from([](msc::vector<int>& v){
+    // moved into, and moved from a second time
+    msc::vector<int> other;
+    other = std::move(v);
+    ASSERT_TRUE(other.empty());
+    v = msc::vector<int>{8};
+    ASSERT_EQ(v.size(), 1u);
+  });
+  on_moved_from([](msc::vector<int>& v){
+    msc::vector<int> full{1, 2, 3};
+    v.swap(full);
+    ASSERT_EQ(v.size(), 3u);
+    ASSERT_TRUE(full.empty());
+    full.push_back(4);                   // the side that received nothing
+    ASSERT_EQ(full.size(), 1u);
+  });
+  on_moved_from([](msc::vector<int>& v){
+    // spliced into, then spliced from
+    msc::vector<int> src{1, 2, 3};
+    v.splice(std::move(src));
+    ASSERT_EQ(v.size(), 3u);
+
+    msc::vector<int> dst{9};
+    msc::vector<int> empty_src{1};
+    msc::vector<int> keep(std::move(empty_src));
+    dst.splice(std::move(empty_src));    // a moved from source contributes nothing
+    ASSERT_EQ(dst.size(), 1u);
+  });
+}
+
+
+TEST(vector, moved_from_non_trivial_balanced)
+{
+  B::reset();
+  {
+    msc::vector<B> a;
+    fill(a, 50);
+    msc::vector<B> b(std::move(a));
+    ASSERT_EQ(B::live, 50u);             // the move touched no element
+
+    fill(a, 10);                         // the moved from vector is reused
+    ASSERT_EQ(B::live, 60u);
+
+    a = std::move(b);                    // its 10 die, the 50 change hands
+    ASSERT_EQ(B::live, 50u);
+    ASSERT_EQ(a.size(), 50u);
+    ASSERT_EQ(a[49].value(), 49);
+  }
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
+}
+
+
+TEST(vector, moving_needs_no_reservation)
+{
+  // both moves used to give their source a fresh 1 TiB reservation. once the
+  // address space was used up, that mmap failed inside a noexcept function,
+  // which is std::terminate: the whole process died on a plain move. a moved
+  // from vector owns nothing now, so a move needs no reservation at all
+  std::vector<msc::vector<int>> held;
+  held.reserve(1000);                        // no reallocation while exhausted
+  try {
+    while(held.size() < 1000) held.emplace_back().push_back(1);
+  } catch(const std::bad_alloc&) {}
+  if(held.size() == 1000) GTEST_SKIP() << "could not exhaust the address space";
+  ASSERT_GT(held.size(), 1u);
+
+  // every reservation is taken; the old move would terminate right here
+  msc::vector<int> moved(std::move(held.back()));
+  ASSERT_EQ(moved.size(), 1u);
+  ASSERT_EQ(moved[0], 1);
+  ASSERT_TRUE(held.back().empty());
+
+  // the moved from vector cannot map anything now, and says so with an
+  // exception rather than by terminating
+  ASSERT_THROW(held.back().push_back(2), std::bad_alloc);
+  ASSERT_TRUE(held.back().empty());
+
+  held[0] = std::move(moved);
+  ASSERT_EQ(held[0].size(), 1u);
+}
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Shifting elements that are not trivially copyable
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * Runs the same inserts and erases on an msc::vector and a std::vector and
+ * compares them after each step. operator== walks a list or a tree and looks
+ * up every key of a hash container, which is exactly where a shift done by
+ * copying bytes leaves stale pointers behind. Both vectors are destroyed in
+ * their shifted state, which is where a stale sentinel used to crash.
+ */
+template<class T, class Make>
+void mirror_shifts(Make make){
+  msc::vector<T> got;
+  std::vector<T> want;
+  for(int i = 0; i < 40; ++i){
+    got.push_back(make(i));
+    want.push_back(make(i));
+  }
+  auto same = [&](const char* step){
+    ASSERT_EQ(got.size(), want.size()) << step;
+    for(size_t i = 0; i < want.size(); ++i){
+      ASSERT_TRUE(got[i] == want[i]) << step << ", element " << i;
+    }
+  };
+
+  got.insert(got.begin(), make(100));
+  want.insert(want.begin(), make(100));
+  same("insert at the front");
+
+  got.insert(got.begin() + 20, make(101));
+  want.insert(want.begin() + 20, make(101));
+  same("insert in the middle");
+
+  got.emplace(got.begin() + 5, make(102));
+  want.emplace(want.begin() + 5, make(102));
+  same("emplace");
+
+  const T filler = make(103);
+  got.insert(got.begin() + 3, 4, filler);
+  want.insert(want.begin() + 3, 4, filler);
+  same("insert count");
+
+  const std::vector<T> more{make(200), make(201), make(202)};
+  got.insert_range(got.begin() + 7, more);
+  want.insert_range(want.begin() + 7, more);
+  same("insert_range");
+
+  got.erase(got.begin());
+  want.erase(want.begin());
+  same("erase at the front");
+
+  got.erase(got.begin() + 10, got.begin() + 25);
+  want.erase(want.begin() + 10, want.begin() + 25);
+  same("erase a range");
+
+  got.erase(got.end() - 1);
+  want.erase(want.end() - 1);
+  same("erase the last");
+}
+
+/**
+ * Counts copies and moves separately, to show the shift moves existing
+ * elements rather than copying them.
+ */
+struct Moves {
+  static inline size_t copies = 0;
+  static inline size_t moves  = 0;
+  static void reset(){ copies = 0; moves = 0; }
+
+  int v;
+  explicit Moves(int x) : v(x) {}
+  Moves(const Moves& o) : v(o.v) { ++copies; }
+  Moves(Moves&& o) noexcept : v(o.v) { ++moves; }
+  Moves& operator=(const Moves& o){ v = o.v; ++copies; return *this; }
+  Moves& operator=(Moves&& o) noexcept { v = o.v; ++moves; return *this; }
+};
+
+/**
+ * A copy constructor that throws on command, to check a failed insert leaves
+ * the vector as it was.
+ */
+struct Fragile {
+  static inline int    copies_left = -1;     // -1 never throws
+  static inline size_t live        = 0;
+
+  int v;
+  explicit Fragile(int x) : v(x) { ++live; }
+  Fragile(const Fragile& o) : v(o.v) {
+    if(copies_left == 0) throw std::runtime_error("copy failed");
+    if(copies_left > 0) --copies_left;
+    ++live;
+  }
+  Fragile& operator=(const Fragile&) = default;
+  ~Fragile(){ --live; }
+};
+
+/**
+ * A forward iterator over ints whose dereference throws once its budget runs
+ * out, to fail an insert on the memmove path part way through.
+ */
+struct ThrowingIt {
+  using iterator_concept  = std::forward_iterator_tag;
+  using iterator_category = std::forward_iterator_tag;
+  using value_type        = int;
+  using difference_type   = std::ptrdiff_t;
+
+  const int* p      = nullptr;
+  int*       budget = nullptr;
+
+  int operator*() const {
+    if((*budget)-- == 0) throw std::runtime_error("read failed");
+    return *p;
+  }
+  ThrowingIt& operator++(){ ++p; return *this; }
+  ThrowingIt  operator++(int){ ThrowingIt t = *this; ++p; return t; }
+  bool operator==(const ThrowingIt& o) const { return p == o.p; }
+};
+
+} // namespace
+
+static_assert(!std::is_trivially_copyable_v<std::string>);
+static_assert(!std::is_trivially_copyable_v<Moves>);
+static_assert(std::forward_iterator<ThrowingIt>);
+
+
+TEST(vector, shift_self_referential_types)
+{
+  // each of these points into itself under libstdc++, so moving its bytes
+  // breaks it: a short string at its own buffer, the node containers at a
+  // sentinel stored in the container object. they used to corrupt or crash
+  mirror_shifts<std::string>([](int i){ return std::to_string(i); });
+  mirror_shifts<std::list<int>>([](int i){ return std::list<int>{i, i + 1}; });
+  mirror_shifts<std::map<int, int>>([](int i){ return std::map<int, int>{{i, i}}; });
+  mirror_shifts<std::set<int>>([](int i){ return std::set<int>{i, i + 1}; });
+  mirror_shifts<std::unordered_map<int, int>>(
+      [](int i){ return std::unordered_map<int, int>{{i, i}, {i + 1, i}}; });
+  mirror_shifts<std::unordered_set<int>>(
+      [](int i){ return std::unordered_set<int>{i, i + 1}; });
+}
+
+
+TEST(vector, shift_trivially_copyable_types)
+{
+  // the memmove path has to give the same results as the move path
+  mirror_shifts<int>([](int i){ return i; });
+  mirror_shifts<A>([](int i){ return A{static_cast<size_t>(i)}; });
+}
+
+
+TEST(vector, insert_aliasing_matches_std_vector)
+{
+  // the value may be an element of the vector itself, and the standard requires
+  // insert and emplace to cope. the memmove used to shift the element before it
+  // was read, so v.insert(v.begin(), v[2]) inserted whatever had moved into [2]
+  auto check = [](auto make){
+    using T = decltype(make(0));
+    msc::vector<T> got;
+    std::vector<T> want;
+    for(int i = 0; i < 8; ++i){ got.push_back(make(i)); want.push_back(make(i)); }
+
+    got.insert(got.begin(), got[2]);          want.insert(want.begin(), want[2]);
+    got.insert(got.begin(), 3, got[5]);       want.insert(want.begin(), 3, want[5]);
+    got.emplace(got.begin() + 1, got[7]);     want.emplace(want.begin() + 1, want[7]);
+    got.insert(got.begin() + 2, got.back());  want.insert(want.begin() + 2, want.back());
+    got.insert(got.end(), got.front());       want.insert(want.end(), want.front());
+
+    ASSERT_EQ(got.size(), want.size());
+    for(size_t i = 0; i < want.size(); ++i) ASSERT_TRUE(got[i] == want[i]) << "at " << i;
+  };
+  check([](int i){ return i; });                               // memmove path
+  check([](int i){ return std::to_string(i); });               // move path
+  check([](int i){ return std::string(30, 'a' + i); });        // move path, heap buffers
+}
+
+
+TEST(vector, insert_moves_rather_than_copies)
+{
+  // on the move path existing elements must travel by move; the only copies
+  // are the ones the caller asked for
+  msc::vector<Moves> a;
+  for(int i = 0; i < 50; ++i) a.emplace_back(i);
+
+  Moves::reset();
+  a.insert(a.begin() + 10, Moves{7});
+  ASSERT_EQ(Moves::copies, 0u);
+  ASSERT_GT(Moves::moves, 0u);
+
+  Moves::reset();
+  const Moves lvalue{8};
+  a.insert(a.begin() + 10, lvalue);
+  ASSERT_EQ(Moves::copies, 1u);                // the inserted value, nothing else
+
+  Moves::reset();
+  a.insert(a.begin() + 20, 3, lvalue);
+  ASSERT_EQ(Moves::copies, 3u);
+
+  Moves::reset();
+  a.erase(a.begin() + 5, a.begin() + 15);
+  ASSERT_EQ(Moves::copies, 0u);
+
+  ASSERT_EQ(a.size(), 45u);
+}
+
+
+TEST(vector, insert_that_throws_leaves_vector_intact)
+{
+  // move path: the new elements are built at the end before anything shifts,
+  // so a failure part way through them changes nothing
+  Fragile::live = 0;
+  {
+    msc::vector<Fragile> a;
+    for(int i = 0; i < 20; ++i) a.emplace_back(i);
+    const Fragile value{99};
+    const size_t live_before = Fragile::live;
+
+    Fragile::copies_left = 2;                  // the third copy throws
+    ASSERT_THROW(a.insert(a.begin() + 5, 4, value), std::runtime_error);
+    Fragile::copies_left = -1;
+
+    ASSERT_EQ(a.size(), 20u);
+    ASSERT_EQ(Fragile::live, live_before);     // the two it did build are gone
+    for(int i = 0; i < 20; ++i) ASSERT_EQ(a[i].v, i);
+  }
+  ASSERT_EQ(Fragile::live, 0u);
+
+  // memmove path: the tail is shifted up before the copy, and has to be
+  // shifted back down when the copy fails
+  msc::vector<int> b;
+  for(int i = 0; i < 10; ++i) b.push_back(i);
+  const int src[] = {100, 101, 102, 103, 104};
+  int budget = 2;                              // the third read throws
+  ASSERT_THROW(b.insert(b.begin() + 3, ThrowingIt{src, &budget}, ThrowingIt{src + 5, &budget}),
+               std::runtime_error);
+  ASSERT_EQ(b.size(), 10u);
+  for(int i = 0; i < 10; ++i) ASSERT_EQ(b[i], i);
 }

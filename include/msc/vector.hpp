@@ -1,3 +1,31 @@
+// msc::vector - https://github.com/M-Scheinost/vector
+// SPDX-FileCopyrightText: 2026 Manuel Scheinost
+// SPDX-License-Identifier: MIT
+
+/*
+
+Copyright (c) 2026 Manuel Scheinost
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
 #pragma once
 
 #include <sys/mman.h>
@@ -14,6 +42,7 @@
 #include <compare>
 #include <concepts>
 #include <span>
+#include <utility>
 
 
 
@@ -44,13 +73,6 @@ private:
   static constexpr std::size_t rounddown(std::size_t x, std::size_t a) {return x / a * a;}
 
 
-  /**
-   * The standard's exposition only synth-three-way, used by operator<=>.
-   * An element type that has <=> is ordered by it and keeps its own category;
-   * one that only has < is ordered by two calls to it, which can only ever
-   * justify a weak_ordering. Without this a legacy type with nothing but
-   * operator< would not be comparable at all.
-   */
   static constexpr auto synth_three_way =
     []<class U>(const U& a, const U& b){
       if constexpr (std::three_way_comparable<U>) return a <=> b;
@@ -62,28 +84,12 @@ private:
     };
 
 
-  /**
-   * Byte size of a mapping holding n elements, rounded up to whole pages.
-   * Never returns 0: mmap and mremap reject zero length mappings with EINVAL,
-   * so an empty vector still owns one page and data() stays a valid pointer.
-   */
   static constexpr std::size_t capacity_bytes(std::size_t n) {
     std::size_t bytes = roundup(n * sizeof(T), PAGE_SIZE);
     return bytes == 0 ? PAGE_SIZE : bytes;
   }
 
 
-  /**
-   * Grows the vector by the factor size_multiplier.
-   *
-   * The factor applies to bytes, so the result has to be converted back to an
-   * element count, and that division truncates. Once sizeof(T) reaches a
-   * quarter of the current capacity the truncation swallows the entire
-   * increment and the call becomes a no op, leaving the caller to construct
-   * into a page that was never mapped. Flooring the target one page above the
-   * current mapping keeps every call moving; it only binds while the vector is
-   * small, so the growth factor is unchanged once 25% exceeds a page.
-   */
   void grow(){
     std::size_t target = static_cast<std::size_t>(static_cast<double>(capacity_) * size_multiplier);
     if(target < capacity_ + PAGE_SIZE) target = capacity_ + PAGE_SIZE;
@@ -91,15 +97,16 @@ private:
   }
 
 
-  /**
-   * Every path that can enlarge the vector ends up here, so this is the one
-   * place the max_size() limit has to be enforced. Beyond conforming to what
-   * std::vector promises, the check is what keeps capacity_bytes() safe: it
-   * multiplies by sizeof(T), and that product can only overflow for a count
-   * this rejects.
-   */
   void grow(std::size_t new_cap){
     if(new_cap > max_size()) throw std::length_error("vector::grow: size exceeds max_size()");
+
+    // a moved from vector owns no mapping. It reserves one the first time it
+    // has to hold something, which is what keeps the move itself free of any
+    // syscall and so genuinely noexcept
+    if(!data_){
+      map_reservation();
+      capacity_ = 0;
+    }
 
     std::size_t new_capacity = capacity_bytes(new_cap);
     if(capacity_ >= new_capacity) return;
@@ -110,30 +117,20 @@ private:
     }
 
 
-  /**
-   * The element count this vector would reach by adding n more, or a throw if
-   * that exceeds max_size(). Written as a subtraction because size_ + n is
-   * exactly the sum that could wrap, which would turn an impossible request
-   * into a small and apparently valid one.
-   */
+
   std::size_t checked_total(std::size_t n) const {
     if(n > max_size() - size_) throw std::length_error("vector: size exceeds max_size()");
     return size_ + n;
   }
 
-
-    /**
-   * Shrinks the capacity of vector to size
-   */
   void shrink(){
     shrink(size_);
   }
 
 
-  /**
-   * Shrinks the size of the vector to new size, cuts of elements if size > new_size to size
-   */
   void shrink(std::size_t new_size){
+    // without a mapping there is no capacity to hand back
+    if(!data_) return;
     std::size_t new_capacity = capacity_bytes(new_size);
     if(new_capacity == capacity_) return;
 
@@ -161,23 +158,27 @@ private:
   }
 
 
-  void init(){
+  /**
+   * Reserves the address range without committing any of it. Kept apart from
+   * init() so grow() can call it for a vector that owns no mapping yet.
+   */
+  void map_reservation(){
      void* p = mmap(nullptr, max_capacity_,
                     PROT_NONE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                     -1, 0);
     if(p == MAP_FAILED) throw std::bad_alloc{};
     data_ = static_cast<std::byte*>(p);
-    int success = mprotect(static_cast<void*>(data_), capacity_, PROT_READ | PROT_WRITE);
-    if(success) throw std::bad_alloc{}; 
   }
 
 
-  /**
-   * Runs every element's destructor and empties the vector without touching the
-   * mapping. clear() releases the pages on top of this; assign() must not, since
-   * it refills immediately and dropping the pages would only fault them back in.
-   */
+  void init(){
+    map_reservation();
+    int success = mprotect(static_cast<void*>(data_), capacity_, PROT_READ | PROT_WRITE);
+    if(success) throw std::bad_alloc{};
+  }
+
+
   void destroy_all() noexcept {
     std::destroy_n(data(), size_);
     size_ = 0;
@@ -185,30 +186,69 @@ private:
 
 
   /**
-   * Opens a gap of n uninitialized slots at index idx and hands the first of
-   * them to construct, which has to fill exactly n. The elements from idx
-   * onwards are relocated bitwise, as everywhere else in this class.
+   * Makes room for n new elements at index idx and has construct build them;
+   * construct fills exactly n uninitialized slots from the pointer it is given.
+   * grow() never relocates the storage, so anything construct reads out of this
+   * vector is still where it was when the insert began.
    *
-   * size_ only grows once construct has succeeded, so if it throws the gap is
-   * closed again and the vector is left exactly as it was.
+   * Trivially copyable elements are moved as bytes: the tail is shifted up
+   * with memmove and construct builds straight into the gap. The shift would
+   * carry along a value that refers into this vector, which is why the value
+   * overloads pass a copy. If construct throws, the tail is shifted back and
+   * the vector is left exactly as it was.
+   *
+   * Anything else has to move through its own move operations, as std::vector
+   * does: copying the bytes of a std::string or a std::list leaves them
+   * pointing at their old address. So construct builds the new elements at the
+   * end instead, where a failure disturbs nothing and arguments that refer into
+   * this vector are still intact, and they are then rotated into place. The
+   * rotation only ever moves between live objects, so even a move that throws
+   * part way leaves every slot holding a valid element.
    */
   template<class F>
   T* insert_n(std::size_t idx, std::size_t n, F&& construct){
     if(n == 0) return data() + idx;
     grow(checked_total(n));
 
-    std::byte* from = data_ + idx * sizeof(T);
-    const std::size_t tail_bytes = (size_ - idx) * sizeof(T);
-    std::memmove(from + n * sizeof(T), from, tail_bytes);
+    if constexpr (std::is_trivially_copyable_v<T>){
+      std::byte* from = data_ + idx * sizeof(T);
+      const std::size_t tail_bytes = (size_ - idx) * sizeof(T);
+      std::memmove(from + n * sizeof(T), from, tail_bytes);
 
-    try {
-      construct(data() + idx);
-    } catch(...) {
-      std::memmove(from, from + n * sizeof(T), tail_bytes);
-      throw;
+      try {
+        construct(data() + idx);
+      } catch(...) {
+        std::memmove(from, from + n * sizeof(T), tail_bytes);
+        throw;
+      }
+      size_ += n;
+    } else {
+      T* const first = data() + idx;
+      T* const mid   = data() + size_;
+      construct(mid);
+      // from here on every slot below size_ holds a live object, so however
+      // the rotation ends the destructor sees exactly what exists
+      size_ += n;
+      rotate_into_place(first, mid, mid + n);
     }
-    size_ += n;
     return data() + idx;
+  }
+
+
+  /**
+   * Moves [mid, last) in front of [first, mid). A single element, by far the
+   * common case, goes through one temporary and one move_backward, which moves
+   * every element once; std::rotate would swap them, at three moves apiece.
+   */
+  static void rotate_into_place(T* first, T* mid, T* last){
+    if(first == mid) return;
+    if(last - mid == 1){
+      T tmp(std::move(*mid));
+      std::move_backward(first, mid, last);
+      *first = std::move(tmp);
+    } else {
+      std::rotate(first, mid, last);
+    }
   }
 
 
@@ -242,22 +282,17 @@ private:
     }
     size_ += other.size_;
 
+    // the source is left owning nothing, exactly like a moved from vector. It
+    // used to get a fresh reservation here, but if that mmap failed the source
+    // was stranded with no mapping and a capacity still claiming one page, so
+    // its next push_back wrote through a null pointer
     munmap(other.data_, max_capacity_);
-    other.capacity_ = PAGE_SIZE;
-    other.size_ = 0;
-    other.data_ = nullptr;
-    other.init();
+    other.data_     = nullptr;
+    other.size_     = 0;
+    other.capacity_ = 0;
   }
 
 
-  /**
-   * How a single source is going to be consumed by splice_all.
-   *
-   * body is the leading run of bytes that sits on a stride boundary and can be
-   * handed to mremap; tail is whatever is left over and has to be copied. A
-   * source small enough for COPY_LIMIT, or shorter than one whole stride, is
-   * all tail: the syscall would cost more than the copy it saves.
-   */
   struct source_split {
     std::size_t body;
     std::size_t tail;
@@ -302,13 +337,6 @@ private:
     const std::size_t first_body     = rounddown(size_bytes, stride);
     const std::size_t first_spill    = size_bytes - first_body;
 
-    // ---- measure, before anything is touched ----
-    // alongside the sizes this costs both strategies in bytes copied, because
-    // batching is not always the cheaper one. mremap carries a source's tail
-    // along for free when the whole mapping moves, which is what the pairwise
-    // form does; batching gives that up to keep the bodies adjacent, and pays
-    // for it once per source. Which way that goes depends entirely on how close
-    // the sources are to a stride boundary, so it is measured rather than assumed
     std::size_t added         = 0;
     std::size_t body_total    = 0;
 
@@ -354,22 +382,18 @@ private:
         body_cursor += sp.body;
       }
 
-      // one copy, straight to the place this tail keeps
       if(sp.tail){
         std::memcpy(data_ + tail_cursor, s->data_ + sp.body, sp.tail);
         tail_cursor += sp.tail;
       }
 
       if(sp.body){
-        // the prefix was moved out from under it; this releases what is left,
-        // including the reservation beyond the source's live capacity
         munmap(s->data_ + sp.body, max_capacity_ - sp.body);
+        // left owning nothing, as splice() and a move leave their source
         s->data_     = nullptr;
         s->size_     = 0;
-        s->capacity_ = PAGE_SIZE;
-        s->init();
+        s->capacity_ = 0;
       } else {
-        // the bytes now live here, so the source's storage holds no object
         std::memset(s->data_, 0, s->size_ * sizeof(T));
         s->size_ = 0;
       }
@@ -434,11 +458,11 @@ public:
     }
     size_ = other.size_;
   }
-  vector(vector&& other) noexcept : data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
-    other.size_     = 0;
-    other.capacity_ = PAGE_SIZE;
-    other.init();
-  }
+
+  vector(vector&& other) noexcept
+    : data_(std::exchange(other.data_, nullptr)),
+      size_(std::exchange(other.size_, 0)),
+      capacity_(std::exchange(other.capacity_, 0)) {}
 
   vector& operator=(const vector& other){
     if(this == &other) return *this;
@@ -452,7 +476,6 @@ public:
     std::destroy_n(data(), size_);
     size_ = 0;
 
-    // grow() counts elements and only ever grows, so a bigger capacity stays
     grow(other.size_);
     std::uninitialized_copy_n(reinterpret_cast<const T*>(other.data_),
                               other.size_, data());
@@ -466,13 +489,9 @@ public:
     std::destroy_n(data(), size_);
     if(data_) munmap(data_, max_capacity_);
 
-    data_     = other.data_;
-    size_     = other.size_;
-    capacity_ = other.capacity_;
-
-    other.size_     = 0;
-    other.capacity_ = PAGE_SIZE;
-    other.init();
+    data_     = std::exchange(other.data_, nullptr);
+    size_     = std::exchange(other.size_, 0);
+    capacity_ = std::exchange(other.capacity_, 0);
     return *this;
   }
 
@@ -491,9 +510,6 @@ public:
    * smaller keeps the capacity that was already there, as std::vector does.
    */
   void assign(size_type count, const T& value){
-    // grow first: it is the step that can throw, and it only ever enlarges the
-    // mapping without touching an element, so a request that is refused leaves
-    // the vector exactly as it was rather than emptied
     grow(count);
     destroy_all();
     std::uninitialized_fill_n(data(), count, value);
@@ -573,30 +589,38 @@ public:
 //----------------------------------------------------------------------------------------------------------------------------------------------------
   void clear (){
     destroy_all();
+    // a vector without a mapping has no pages to release
+    if(!data_) return;
     int success = madvise(data_, capacity_, MADV_DONTNEED);
     if(success) throw std::bad_alloc{};
-    // success = mprotect(data_, capacity_, PROT_NONE);
-    //  if(success) throw std::bad_alloc{};
-    //  success = mprotect(data_, PAGE_SIZE, PROT_READ | PROT_WRITE);
-    //  if(success) throw std::bad_alloc{};
     size_ = 0;
-    // capacity_ = PAGE_SIZE;
   }
 
 
   iterator insert(const_iterator pos, const T& value){
-    return insert_n(pos - cbegin(), 1, [&](T* p){ ::new (p) T(value); });
+    return emplace(pos, value);
   }
 
 
   iterator insert(const_iterator pos, T&& value){
-    return insert_n(pos - cbegin(), 1, [&](T* p){ ::new (p) T(std::move(value)); });
+    return emplace(pos, std::move(value));
   }
 
 
+  /**
+   * value may be an element of this vector itself. On the memmove path the
+   * shift would move it before it is read, so a copy goes in instead; the
+   * other path builds the new elements before anything moves.
+   */
   iterator insert(const_iterator pos, size_type count, const T& value){
-    return insert_n(pos - cbegin(), count,
-                    [&](T* p){ std::uninitialized_fill_n(p, count, value); });
+    if constexpr (std::is_trivially_copyable_v<T>){
+      const T copy(value);
+      return insert_n(pos - cbegin(), count,
+                      [&](T* p){ std::uninitialized_fill_n(p, count, copy); });
+    } else {
+      return insert_n(pos - cbegin(), count,
+                      [&](T* p){ std::uninitialized_fill_n(p, count, value); });
+    }
   }
 
 
@@ -620,27 +644,51 @@ public:
     });
   }
 
+  /**
+   * The arguments may refer into this vector, as in v.emplace(v.begin(), v[2]).
+   * On the memmove path the element is therefore built before the shift and
+   * copied into the gap afterwards, which for a trivially copyable type costs
+   * no more than a memcpy. The other path builds it in place at the end,
+   * before anything has moved.
+   */
   template<class... Args>
   iterator emplace(const_iterator pos, Args&&... args){
-    return insert_n(pos - cbegin(), 1,
-                    [&](T* p){ ::new (p) T(std::forward<Args>(args)...); });
+    if constexpr (std::is_trivially_copyable_v<T>){
+      // moved rather than copied into the gap, so a trivially copyable type
+      // whose copy constructor is deleted still works
+      T value(std::forward<Args>(args)...);
+      return insert_n(pos - cbegin(), 1, [&](T* p){ ::new (p) T(std::move(value)); });
+    } else {
+      return insert_n(pos - cbegin(), 1,
+                      [&](T* p){ ::new (p) T(std::forward<Args>(args)...); });
+    }
   }
 
   /**
    * Removes [first, last) and closes the gap, returning an iterator to the
-   * element that took first's place. Destructors are noexcept, so nothing here
-   * can fail part way.
+   * element that took first's place.
+   *
+   * Trivially copyable elements have nothing to destroy and the bytes simply
+   * close the gap, so nothing here can fail. Anything else is shifted down with
+   * its own move assignment and the moved from objects left at the end are
+   * destroyed, as std::vector does; if an assignment throws, every slot still
+   * holds a valid element.
    */
   iterator erase(const_iterator first, const_iterator last){
     const auto idx = static_cast<size_type>(first - cbegin());
     const auto n   = static_cast<size_type>(last - first);
-    // the position is const, so the destruction and the returned iterator both
-    // go through data() rather than through the parameter
+    // the position is const, so the shift and the returned iterator both go
+    // through data() rather than through the parameter
     if(n == 0) return data() + idx;
 
-    std::destroy_n(data() + idx, n);
-    std::byte* to = data_ + idx * sizeof(T);
-    std::memmove(to, to + n * sizeof(T), (size_ - idx - n) * sizeof(T));
+    if constexpr (std::is_trivially_copyable_v<T>){
+      std::byte* to = data_ + idx * sizeof(T);
+      std::memmove(to, to + n * sizeof(T), (size_ - idx - n) * sizeof(T));
+    } else {
+      T* const gap = data() + idx;
+      std::move(gap + n, data() + size_, gap);
+      std::destroy(data() + size_ - n, data() + size_);
+    }
     size_ -= n;
     return data() + idx;
   }
@@ -649,23 +697,6 @@ public:
     return erase(pos, pos + 1);
   }
 
-  /**
-   * Both overloads defer to emplace_back, which constructs into the slot.
-   * Assigning instead would run operator= on storage no object lives in yet,
-   * which is undefined and crashes outright for any type whose assignment
-   * reads its own state before overwriting it.
-   *
-   * push_back(const T&) copies, so it needs a copy constructor. It is a non
-   * template member, so it is only instantiated where it is called: a move only
-   * T is fine as long as callers stay on the rvalue overload, and asking for the
-   * copy is a compile error at the call site rather than anything at runtime.
-   *
-   * Passing an element of this same vector is safe, which std::vector cannot
-   * promise. Growing is an mprotect over a mapping reserved up front, so the
-   * storage never moves and val is still live when the copy runs; a reallocating
-   * vector would have destroyed it first. This holds for the growth path only,
-   * splice() relocates with mremap and insert()/erase() shift with memmove.
-   */
   void push_back(const T& val){ emplace_back(val); }
   void push_back(T&& val){ emplace_back(std::move(val)); }
     
@@ -705,11 +736,6 @@ public:
 
   void pop_back(){ --size_; std::destroy_at(data() + size_); }
 
-  /**
-   * Both overloads leave the capacity alone when they shrink. Releasing the
-   * pages is shrink_to_fit's job, and the private shrink() that does it only
-   * looks like this operation.
-   */
   void resize(size_type count){
     if(count < size_){
       std::destroy_n(data() + count, size_ - count);
@@ -732,11 +758,6 @@ public:
     }
   }
 
-  /**
-   * Every vector owns an independent mapping, so this exchanges three scalars
-   * and never touches an element. There is no allocator to propagate, which is
-   * what makes it unconditionally noexcept.
-   */
   void swap(vector& other) noexcept {
     std::swap(data_,     other.data_);
     std::swap(size_,     other.size_);
@@ -800,15 +821,6 @@ public:
 //    Comparison
 //----------------------------------------------------------------------------------------------------------------------------------------------------
 
-  /**
-   * Hidden friends, as the standard declares both for std::vector. == is never
-   * synthesized from <=>, so the two are independent and both are needed.
-   *
-   * The constraints keep std::equality_comparable<vector<T>> and
-   * std::three_way_comparable<vector<T>> honest: an element type that cannot be
-   * compared makes the operator drop out of overload resolution instead of
-   * answering "yes" and then hard erroring inside std::equal.
-   */
   friend bool operator==(const vector& lhs, const vector& rhs)
     requires std::equality_comparable<T>
   {
