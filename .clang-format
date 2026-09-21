@@ -1,0 +1,45 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+IndentWidth: 2
+ColumnLimit: 100
+AccessModifierOffset: -2
+NamespaceIndentation: None
+
+# std::byte* data_, not std::byte *data_
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+# the codebase writes if(x) and for(...), not if (x)
+SpaceBeforeParens: Never
+
+# one-line accessors like `reference front() { return data()[0]; }` stay on one line
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortBlocksOnASingleLine: Empty
+
+AlwaysBreakTemplateDeclarations: Yes
+# template<class T>, not template <class T>
+SpaceAfterTemplateKeyword: false
+
+# braces stay on the line they open, except the namespace's, which gets its own
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterNamespace: true
+
+# member functions are separated by two blank lines throughout
+MaxEmptyLinesToKeep: 2
+
+# runs of assignments are lined up on the = throughout, e.g.
+#     other.data_     = nullptr;
+#     other.capacity_ = 0;
+AlignConsecutiveAssignments: Consecutive
+
+# the section banners are long rules of dashes; reflowing would chop them up
+ReflowComments: false
+
+# include order here is deliberate (<sys/mman.h> first); leave it alone
+SortIncludes: Never
+...
