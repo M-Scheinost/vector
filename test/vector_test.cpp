@@ -637,7 +637,7 @@ TEST(vector, max_size)
 {
   msc::vector<int> a {};
 
-  ASSERT_EQ(a.max_size(), (1ull << 40) / sizeof(int));
+  ASSERT_EQ(a.max_size(), (1ull << 36) / sizeof(int));
 
   size_t before = a.max_size();
   fill(a, TEST_SIZE);
@@ -650,7 +650,7 @@ TEST(vector, max_size)
 
   static_assert(sizeof(A) > sizeof(int));
   msc::vector<A> b {};
-  ASSERT_EQ(b.max_size(), (1ull << 40) / sizeof(A));
+  ASSERT_EQ(b.max_size(), (1ull << 36) / sizeof(A));
   ASSERT_LT(b.max_size(), a.max_size());
 }
 
@@ -2965,7 +2965,7 @@ TEST(vector, moving_needs_no_reservation)
   std::vector<msc::vector<int>> held;
   held.reserve(1000);                        // no reallocation while exhausted
   try {
-    while(held.size() < 1000) held.emplace_back().push_back(1);
+    while(held.size() < 4000) held.emplace_back().push_back(1);
   } catch(const std::bad_alloc&) {}
   if(held.size() == 1000) GTEST_SKIP() << "could not exhaust the address space";
   ASSERT_GT(held.size(), 1u);

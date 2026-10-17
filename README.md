@@ -1,6 +1,6 @@
 # msc::vector
 
-A vector with the same functionalities and interface as a `std::vector` but without moving data on growth and a splice method that moves remaps pages instead of copying data.
+A vector with the same functionalities and interface as a `std::vector` but without moving data on growth and a splice method that moves pages instead of copying data.
 This results in overall superior performance over a `std::vector`, especially when handling large amounts of data.
 See [Limitations](#limitations) for when to not use it.
 
@@ -75,7 +75,7 @@ Filling an empty `vector<int>` with emplace_back:
 include(FetchContent)
 FetchContent_Declare(msc_vector
     GIT_REPOSITORY https://github.com/M-Scheinost/vector.git
-    GIT_TAG        v1.0.0)
+    GIT_TAG        v1.0.1)
 FetchContent_MakeAvailable(msc_vector)
 
 target_link_libraries(your_target PRIVATE msc::vector)
@@ -124,7 +124,7 @@ spliced data. After splicing `{1,2,3}` onto `{a,b,c}` you get all six elements,
 but not necessarily in that order. If element order is important use the `insert`/`append`
 methods. They work like `std::vectors` methods and never change order.
 
-**The number of simultaneously held vectors is limited** Each vector reserves a virtual address range. Virtual addresses are limited, which limits vectors. Empty/Unused/Cleared vectors reserve their address ranges. Rule of thumb ~100 vectors are no problem and deconstruct vectors when they aren't needed anymore.
+**The number of simultaneously held vectors is limited** Each vector reserves a virtual address range. Virtual addresses are limited, which limits vectors. Empty/Unused/Cleared vectors reserve their address ranges. Rule of thumb ~2000 vectors are no problem and deconstruct vectors when they aren't needed anymore.
 
 **4 KiB pages are assumed.** ARM64 might have different ones
 
