@@ -64,8 +64,9 @@ public:
   static constexpr std::size_t PAGE_SIZE  = 4096; // sysconf(_SC_PAGESIZE);
   static constexpr std::size_t COPY_LIMIT = PAGE_SIZE * 128;
 
-private:
-  static constexpr std::size_t max_capacity_ = (1ull << 40);
+private: 
+  // 1 << 36 -> 64 GB
+  static constexpr std::size_t max_capacity_ = (1ull << 36);
 
 
   static constexpr std::size_t roundup(std::size_t x, std::size_t a) { return (x + a - 1) / a * a; }
