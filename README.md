@@ -109,7 +109,7 @@ Filling an empty `vector<int>` with emplace_back:
 include(FetchContent)
 FetchContent_Declare(msc_vector
     GIT_REPOSITORY https://github.com/M-Scheinost/vector.git
-    GIT_TAG        v1.0.1)
+    GIT_TAG        v1.1.0)
 FetchContent_MakeAvailable(msc_vector)
 
 target_link_libraries(your_target PRIVATE msc::vector)

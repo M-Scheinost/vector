@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(msc_vector
-        VERSION 1.0.1
+        VERSION 1.1.0
         DESCRIPTION "A page-mapped vector with O(1) splice, built on mmap/mremap"
         LANGUAGES CXX)
 
