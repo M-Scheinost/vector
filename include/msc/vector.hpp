@@ -47,8 +47,43 @@ SOFTWARE.
 
 namespace msc
 {
-template<class T>
+
+// the default belongs to the first declaration, so the definition below omits it
+template<class T, std::size_t MaxSize = (1ull << 36) / sizeof(T)>
+class vector;
+
+namespace detail
+{
+// true for any msc::vector holding T, whatever bound it was given. Splicing
+// reads the source as raw bytes, so the element type has to match exactly
+// while the bound does not have to match at all
+template<class V, class T>
+inline constexpr bool is_vector_of = false;
+template<class T, std::size_t M>
+inline constexpr bool is_vector_of<vector<T, M>, T> = true;
+} // namespace detail
+
+/**
+ * A vector whose storage never moves, backed by a reservation it makes up front.
+ *
+ * MaxSize is the largest number of elements the vector will ever hold, and the
+ * size of the reservation follows from it. It is what max_size() returns, and
+ * asking for more throws std::length_error.
+ * Default size: 64 GiB / sizeof(T)
+ *
+ * Virtual address space is limited.
+ * A 64 GiB default allows about two thousand simultaneous vectors on x86-64.
+ * Lowering this allows much more and increasing it allows one to store more than 64 GiB (if they have the memory).
+ * A vector may be spliced into one with a different bound, and that reaches into the source's members
+ */
+template<class T, std::size_t MaxSize>
 class vector {
+  static_assert(MaxSize <= (~std::size_t{0}) / sizeof(T),
+                "msc::vector: MaxSize elements of T do not fit in std::size_t bytes");
+
+
+  template<class, std::size_t>
+  friend class vector;
 
 private:
   std::byte* data_ = nullptr;
@@ -64,13 +99,15 @@ public:
   static constexpr std::size_t PAGE_SIZE  = 4096; // sysconf(_SC_PAGESIZE);
   static constexpr std::size_t COPY_LIMIT = PAGE_SIZE * 128;
 
-private: 
-  // 1 << 36 -> 64 GB
-  static constexpr std::size_t max_capacity_ = (1ull << 36);
-
-
+private:
   static constexpr std::size_t roundup(std::size_t x, std::size_t a) { return (x + a - 1) / a * a; }
   static constexpr std::size_t rounddown(std::size_t x, std::size_t a) { return x / a * a; }
+
+
+  // maximum capacity in bytes, at least the size of one page
+  static constexpr std::size_t max_capacity_ =
+      MaxSize == 0 ? PAGE_SIZE : roundup(MaxSize * sizeof(T), PAGE_SIZE);
+
 
 
   static constexpr auto synth_three_way = []<class U>(const U& a, const U& b) {
@@ -91,9 +128,13 @@ private:
 
 
   void grow() {
+    if(size_ == MaxSize) throw std::length_error{"vector::grow: cannot grow past max_size"};
     std::size_t target = static_cast<std::size_t>(static_cast<double>(capacity_) * size_multiplier);
     if(target < capacity_ + PAGE_SIZE) target = capacity_ + PAGE_SIZE;
-    grow(roundup(target, sizeof(T)) / sizeof(T));
+    // clamped rather than left to throw: a vector approaching its limit has to
+    // grow to exactly MaxSize, not be refused for asking past it
+    const std::size_t want = roundup(target, sizeof(T)) / sizeof(T);
+    grow(want > MaxSize ? MaxSize : want);
   }
 
 
@@ -246,7 +287,8 @@ private:
   }
 
 
-  inline void splice_copy(vector<T>& other) {
+  template<std::size_t M>
+  inline void splice_copy(vector<T, M>& other) {
     std::memcpy(data_ + (size_ * sizeof(T)), other.data_, other.size_ * sizeof(T));
     size_ += other.size_;
     //other is <= PAGE_SIZE no need to remap
@@ -254,7 +296,8 @@ private:
     other.size_ = 0;
   }
 
-  inline void splice_move(vector<T>& other) {
+  template<std::size_t M>
+  inline void splice_move(vector<T, M>& other) {
     constexpr std::size_t stride     = std::lcm(sizeof(T), PAGE_SIZE);
     const std::size_t size_in_bytes  = size_ * sizeof(T);
     const std::size_t other_used_cap = capacity_bytes(other.size_);
@@ -280,7 +323,7 @@ private:
     // used to get a fresh reservation here, but if that mmap failed the source
     // was stranded with no mapping and a capacity still claiming one page, so
     // its next push_back wrote through a null pointer
-    munmap(other.data_, max_capacity_);
+    munmap(other.data_, vector<T, M>::max_capacity_);
     other.data_     = nullptr;
     other.size_     = 0;
     other.capacity_ = 0;
@@ -297,6 +340,28 @@ private:
     if(bytes <= COPY_LIMIT) return {0, bytes};
     const std::size_t body = rounddown(bytes, stride);
     return {body, bytes - body};
+  }
+
+
+  /**
+   * One source handed to splice_all, with its bound erased.
+   *
+   * The sources of a single call may each carry a different bound, so they are
+   * not one type and cannot be passed as a span of pointers. Everything the
+   * algorithm needs is the three members it reads and writes plus the length of
+   * the source's reservation, which is exactly what differs per bound and what
+   * munmap has to be given.
+   */
+  struct source_ref {
+    std::byte**  data;
+    std::size_t* size;
+    std::size_t* capacity;
+    std::size_t  reservation;
+  };
+
+  template<std::size_t M>
+  static source_ref as_source(vector<T, M>& v) noexcept {
+    return source_ref{&v.data_, &v.size_, &v.capacity_, vector<T, M>::max_capacity_};
   }
 
 
@@ -324,7 +389,7 @@ private:
    * The span is walked three times, so it has to be stable across the call, and
    * naming the same vector twice or naming this one is not allowed.
    */
-  void splice_all(std::span<vector* const> sources) {
+  void splice_all(std::span<const source_ref> sources) {
     constexpr std::size_t stride = std::lcm(sizeof(T), PAGE_SIZE);
 
     const std::size_t size_bytes  = size_ * sizeof(T);
@@ -334,13 +399,15 @@ private:
     std::size_t added      = 0;
     std::size_t body_total = 0;
 
-    for(vector* s : sources) {
-      if(s == nullptr || s == this || s->size_ == 0) continue;
-      if(s->size_ > max_size() - size_ - added)
+    // a source naming this very vector is recognised by its data_ member, since
+    // the descriptors carry no type to compare
+    for(const source_ref& s : sources) {
+      if(s.data == &data_ || *s.size == 0) continue;
+      if(*s.size > max_size() - size_ - added)
         throw std::length_error("vector::splice_all: size exceeds max_size()");
-      added += s->size_;
+      added += *s.size;
 
-      const std::size_t bytes = s->size_ * sizeof(T);
+      const std::size_t bytes = *s.size * sizeof(T);
       const source_split sp   = split_source(bytes);
       body_total += sp.body;
     }
@@ -361,34 +428,36 @@ private:
       tail_cursor += first_spill;
     }
 
-    for(vector* s : sources) {
-      if(s == nullptr || s == this || s->size_ == 0) continue;
-      const source_split sp = split_source(s->size_ * sizeof(T));
+    for(const source_ref& s : sources) {
+      if(s.data == &data_ || *s.size == 0) continue;
+      const source_split sp = split_source(*s.size * sizeof(T));
 
       if(sp.body) {
         // only the body is handed to mremap, so the tail stays put in the
         // source's mapping and can be read afterwards. passing the whole
         // mapping would have the kernel drop everything past the new size
-        void* p = mremap(static_cast<void*>(s->data_), sp.body, sp.body,
+        void* p = mremap(static_cast<void*>(*s.data), sp.body, sp.body,
                          MREMAP_MAYMOVE | MREMAP_FIXED, static_cast<void*>(data_ + body_cursor));
         if(p == MAP_FAILED) throw std::bad_alloc{};
         body_cursor += sp.body;
       }
 
       if(sp.tail) {
-        std::memcpy(data_ + tail_cursor, s->data_ + sp.body, sp.tail);
+        std::memcpy(data_ + tail_cursor, *s.data + sp.body, sp.tail);
         tail_cursor += sp.tail;
       }
 
       if(sp.body) {
-        munmap(s->data_ + sp.body, max_capacity_ - sp.body);
+        // the source's own reservation, not ours: the two differ as soon as the
+        // bounds do, and unmapping our length would run past the source's
+        munmap(*s.data + sp.body, s.reservation - sp.body);
         // left owning nothing, as splice() and a move leave their source
-        s->data_     = nullptr;
-        s->size_     = 0;
-        s->capacity_ = 0;
+        *s.data     = nullptr;
+        *s.size     = 0;
+        *s.capacity = 0;
       } else {
-        std::memset(s->data_, 0, s->size_ * sizeof(T));
-        s->size_ = 0;
+        std::memset(*s.data, 0, *s.size * sizeof(T));
+        *s.size = 0;
       }
     }
 
@@ -566,9 +635,11 @@ public:
   //----------------------------------------------------------------------------------------------------------------------------------------------------
   bool empty() const { return size_ == 0 ? true : false; }
   size_type size() const { return size_; }
-  constexpr size_type max_size() const { return max_capacity_ / sizeof(T); }
+  constexpr size_type max_size() const { return MaxSize; }
   void reserve(size_type new_cap) { grow(new_cap); }
-  size_type capacity() const { return capacity_ / sizeof(T); }
+  // the last page is mapped whole and may hold more than MaxSize elements, but
+  // none of them may be used, so capacity() never reports past the limit
+  size_type capacity() const { return std::min(capacity_ / sizeof(T), MaxSize); }
   void shrink_to_fit() { shrink(); }
   //----------------------------------------------------------------------------------------------------------------------------------------------------
   //    Modifiers
@@ -679,6 +750,11 @@ public:
 
   template<class... Args>
   T& emplace_back(Args&&... a) {
+    // the bound is checked here rather than left to grow(), which cannot see it
+    // in either direction: the mapped page may still have room past MaxSize, and
+    // where MaxSize fills its pages exactly the capacity grow() would need is
+    // the capacity it already has, so it returns without noticing
+    if(size_ == MaxSize) throw std::length_error("vector::emplace_back: size exceeds max_size()");
     if((size_ + 1) * sizeof(T) > capacity_) grow();
     T* slot = data() + size_;
     ::new(slot) T(std::forward<Args>(a)...); // <-- construction happens HERE
@@ -750,9 +826,17 @@ public:
   /**
    * Merges two vectors into one.
    * ORDER IS NOT PRESERVED. Some elements may move to the end of the vector.
+   *
+   * The source's bound need not match this vector's: a msc::vector<T, 10> can
+   * be spliced into a msc::vector<T, 1000>. Only the element type has to agree,
+   * because the elements travel as bytes. This vector's bound is what governs
+   * the result, and exceeding it throws std::length_error, so a source that
+   * does not fit is refused rather than truncated.
    */
-  void splice(vector<T>&& other) {
-    if(this == &other || other.size_ == 0) return;
+  template<std::size_t M>
+  void splice(vector<T, M>&& other) {
+    if(static_cast<const void*>(this) == static_cast<const void*>(&other) || other.size_ == 0)
+      return;
 
     grow(checked_total(other.size_));
 
@@ -771,13 +855,15 @@ public:
    * vector's unaligned tail on every step, while this copies each unmappable
    * byte exactly once no matter how many sources there are.
    *
-   * The sources have to be distinct from each other and from this vector.
+   * The sources have to be distinct from each other and from this vector, and
+   * may each carry a different bound.
    */
-  template<std::same_as<vector>... Vs>
-    requires(sizeof...(Vs) > 0)
+  template<class... Vs>
+    requires(sizeof...(Vs) > 1) && (detail::is_vector_of<std::remove_cvref_t<Vs>, T> && ...)
+            && (std::is_rvalue_reference_v<Vs&&> && ...)
   void splice(Vs&&... others) {
-    vector* ptrs[] = {(&others)...};
-    splice_all(std::span<vector* const>{ptrs, sizeof...(Vs)});
+    const source_ref refs[] = {as_source(others)...};
+    splice_all(std::span<const source_ref>{refs, sizeof...(Vs)});
   }
 
   /**
@@ -785,7 +871,7 @@ public:
    * of vectors, for instance a std::vector<msc::vector<T>> of partial results.
    */
   template<std::ranges::input_range R>
-    requires std::same_as<std::remove_cvref_t<std::ranges::range_reference_t<R>>, vector>
+    requires detail::is_vector_of<std::remove_cvref_t<std::ranges::range_reference_t<R>>, T>
   void splice_range(R&& sources) {
     std::size_t n = 0;
     for(auto&& s : sources) {
@@ -794,12 +880,12 @@ public:
     }
     if(n == 0) return;
 
-    auto ptrs     = std::make_unique_for_overwrite<vector*[]>(n);
+    auto refs     = std::make_unique_for_overwrite<source_ref[]>(n);
     std::size_t i = 0;
     for(auto&& s : sources)
-      ptrs[i++] = std::addressof(s);
+      refs[i++] = as_source(s);
 
-    splice_all(std::span<vector* const>{ptrs.get(), n});
+    splice_all(std::span<const source_ref>{refs.get(), n});
   }
 
   //----------------------------------------------------------------------------------------------------------------------------------------------------
@@ -846,18 +932,18 @@ vector(std::from_range_t, R&&) -> vector<std::ranges::range_value_t<R>>;
  * in namespace msc and are found by argument dependent lookup, so an unqualified
  * erase(v, 3) resolves to them without a using declaration.
  */
-template<class T, class U = T>
-typename vector<T>::size_type erase(vector<T>& c, const U& value) {
+template<class T, std::size_t N, class U = T>
+typename vector<T, N>::size_type erase(vector<T, N>& c, const U& value) {
   auto it            = std::remove(c.begin(), c.end(), value);
-  const auto removed = static_cast<typename vector<T>::size_type>(c.end() - it);
+  const auto removed = static_cast<typename vector<T, N>::size_type>(c.end() - it);
   c.erase(it, c.end());
   return removed;
 }
 
-template<class T, class Pred>
-typename vector<T>::size_type erase_if(vector<T>& c, Pred pred) {
+template<class T, std::size_t N, class Pred>
+typename vector<T, N>::size_type erase_if(vector<T, N>& c, Pred pred) {
   auto it            = std::remove_if(c.begin(), c.end(), pred);
-  const auto removed = static_cast<typename vector<T>::size_type>(c.end() - it);
+  const auto removed = static_cast<typename vector<T, N>::size_type>(c.end() - it);
   c.erase(it, c.end());
   return removed;
 }

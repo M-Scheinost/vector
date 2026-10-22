@@ -13,6 +13,7 @@
 #include <ranges>
 #include <limits>
 #include <memory>
+#include <fstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <unordered_map>
@@ -3224,4 +3225,339 @@ TEST(vector, insert_that_throws_leaves_vector_intact)
                std::runtime_error);
   ASSERT_EQ(b.size(), 10u);
   for(int i = 0; i < 10; ++i) ASSERT_EQ(b[i], i);
+}
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    MaxSize template argument
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+// leaving it out has to keep meaning exactly what it did before the parameter
+// existed, so msc::vector<T> stays a drop in for the one argument spelling
+static_assert(std::same_as<msc::vector<int>, msc::vector<int, (1ull << 36) / sizeof(int)>>);
+
+// a different bound is a different type, as with std::array
+static_assert(!std::same_as<msc::vector<int, 10>, msc::vector<int, 20>>);
+static_assert(!std::same_as<msc::vector<int, 10>, msc::vector<int>>);
+
+
+TEST(vector, maxsize_arg_is_what_max_size_returns)
+{
+  // the argument itself, not the page rounded reservation behind it. msc::vector
+  // is not a literal type, since its constructor maps, so this is a run time
+  // check rather than a static_assert
+  ASSERT_EQ((msc::vector<int, 1000>{}.max_size()), 1000u);
+  ASSERT_EQ((msc::vector<int, 3>{}.max_size()), 3u);
+  ASSERT_EQ((msc::vector<A, 7>{}.max_size()), 7u);
+  ASSERT_EQ((msc::vector<int, 0>{}.max_size()), 0u);
+  ASSERT_EQ((msc::vector<int>{}.max_size()), (1ull << 36) / sizeof(int));
+}
+
+
+TEST(vector, maxsize_arg_is_enforced)
+{
+  // 3 ints share a page with room for 1024, so the limit cannot come from the
+  // mapping alone: every growth path has to refuse the fourth element
+  msc::vector<int, 3> a;
+  a.push_back(1);
+  a.emplace_back(2);
+  a.insert(a.cbegin(), 0);
+  ASSERT_EQ(a.size(), 3u);
+  ASSERT_EQ(a.capacity(), 3u) << "capacity must not promise room past max_size()";
+
+  ASSERT_THROW(a.push_back(4), std::length_error);
+  ASSERT_THROW(a.emplace_back(4), std::length_error);
+  ASSERT_THROW(a.insert(a.cbegin(), 4), std::length_error);
+  ASSERT_THROW(a.insert(a.cbegin(), 2, 4), std::length_error);
+  ASSERT_THROW(a.emplace(a.cbegin(), 4), std::length_error);
+  ASSERT_THROW(a.resize(4), std::length_error);
+  ASSERT_THROW(a.reserve(4), std::length_error);
+  ASSERT_THROW(a.assign(4, 0), std::length_error);
+  ASSERT_THROW(a.append_range(std::views::iota(0, 2)), std::length_error);
+
+  // and a refused call leaves it exactly as it was
+  ASSERT_EQ(a.size(), 3u);
+  ASSERT_EQ(a[0], 0);
+  ASSERT_EQ(a[1], 1);
+  ASSERT_EQ(a[2], 2);
+
+  // splicing past the bound is refused too
+  msc::vector<int, 3> b;
+  b.push_back(9);
+  ASSERT_THROW(a.splice(std::move(b)), std::length_error);
+  ASSERT_EQ(a.size(), 3u);
+  ASSERT_EQ(b.size(), 1u);
+}
+
+
+TEST(vector, maxsize_arg_is_reachable)
+{
+  // the implicit growth factor overshoots a bound that is not a whole number of
+  // pages. clamping is what lets the vector fill to exactly MaxSize instead of
+  // being refused on the way there
+  constexpr size_t bound = 2000;                 // 8000 bytes, under two pages
+  msc::vector<int, bound> a;
+  for(size_t i = 0; i < bound; ++i){
+    ASSERT_NO_THROW(a.push_back(static_cast<int>(i))) << "at " << i;
+  }
+  ASSERT_EQ(a.size(), bound);
+  ASSERT_EQ(a.capacity(), bound);
+  for(size_t i = 0; i < bound; ++i) ASSERT_EQ(a[i], static_cast<int>(i)) << "at " << i;
+  ASSERT_THROW(a.push_back(0), std::length_error);
+
+  // a bound that does fill its pages exactly behaves the same way
+  constexpr size_t aligned = PAGE_SIZE / sizeof(int) * 2;
+  msc::vector<int, aligned> b;
+  for(size_t i = 0; i < aligned; ++i) ASSERT_NO_THROW(b.push_back(static_cast<int>(i)));
+  ASSERT_EQ(b.size(), aligned);
+  ASSERT_THROW(b.push_back(0), std::length_error);
+}
+
+
+TEST(vector, maxsize_arg_shrinks_the_reservation)
+{
+  // the point of the parameter: a smaller bound reserves less address space, so
+  // more vectors can be alive at once. measured through VmSize, since the
+  // reservation costs address space rather than memory
+  auto vm_kb = []{
+    std::ifstream st("/proc/self/status");
+    std::string key;
+    size_t kb = 0;
+    while(st >> key){
+      if(key == "VmSize:"){ st >> kb; break; }
+    }
+    return kb;
+  };
+  auto per_vector_kb = [&](auto make){
+    constexpr size_t n = 16;
+    const size_t before = vm_kb();
+    std::vector<decltype(make())> held;
+    held.reserve(n);
+    for(size_t i = 0; i < n; ++i) held.push_back(make());
+    const size_t after = vm_kb();
+    return (after - before) / n;
+  };
+
+  const size_t bounded = per_vector_kb([]{ return msc::vector<int, 1000>{}; });
+  const size_t medium  = per_vector_kb([]{ return msc::vector<int, 1000000>{}; });
+
+  // 1000 ints fit in a single page; a million need about 4 MiB
+  ASSERT_LE(bounded, 64u) << "a 1000 element bound should reserve about one page";
+  ASSERT_GE(medium, 1024u) << "a million element bound should reserve megabytes";
+  ASSERT_LT(medium, 64u * 1024u) << "and nowhere near the 64 GiB default";
+}
+
+
+TEST(vector, maxsize_arg_with_non_trivial_elements)
+{
+  // the bound has to hold for a type that is shifted by its move operations
+  // rather than as bytes, and nothing may leak when a call is refused
+  B::reset();
+  {
+    msc::vector<B, 5> a;
+    for(size_t i = 0; i < 5; ++i) a.emplace_back(i);
+    ASSERT_EQ(B::live, 5u);
+
+    const size_t live_before = B::live;
+    ASSERT_THROW(a.emplace_back(99), std::length_error);
+    ASSERT_THROW(a.insert(a.cbegin(), B{99}), std::length_error);
+    ASSERT_EQ(B::live, live_before) << "a refused insert must not leak an element";
+    ASSERT_EQ(a.size(), 5u);
+    for(size_t i = 0; i < 5; ++i) ASSERT_EQ(a[i].value(), static_cast<int>(i));
+  }
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
+}
+
+
+namespace {
+
+/**
+ * Fills a bounded vector to exactly its bound, then asks for one more.
+ *
+ * The interesting part is where MaxSize sits relative to a page. A bound that
+ * stops short of a page boundary leaves usable room past max_size(); a bound
+ * that lands exactly on one leaves the capacity grow() would ask for equal to
+ * the capacity it already has, so grow() cannot report the overflow either way
+ * and the check has to live in emplace_back.
+ */
+template<size_t N>
+void fill_to_bound(){
+  msc::vector<int, N> v;
+  for(size_t i = 0; i < N; ++i){
+    ASSERT_EQ(v.size(), i) << "MaxSize " << N;
+    ASSERT_NO_THROW(v.push_back(static_cast<int>(i))) << "MaxSize " << N << " at " << i;
+  }
+  ASSERT_EQ(v.size(), N) << "MaxSize " << N;
+  ASSERT_EQ(v.capacity(), N) << "MaxSize " << N;
+  for(size_t i = 0; i < N; ++i){
+    ASSERT_EQ(v[i], static_cast<int>(i)) << "MaxSize " << N << " at " << i;
+  }
+  ASSERT_THROW(v.push_back(0), std::length_error) << "MaxSize " << N;
+  ASSERT_EQ(v.size(), N) << "MaxSize " << N;
+}
+
+} // namespace
+
+
+TEST(vector, maxsize_arg_across_page_boundaries)
+{
+  constexpr size_t per_page = PAGE_SIZE / sizeof(int);
+  fill_to_bound<1>();
+  fill_to_bound<3>();
+  fill_to_bound<per_page - 1>();
+  fill_to_bound<per_page>();          // exactly one page
+  fill_to_bound<per_page + 1>();
+  fill_to_bound<per_page * 2 - 1>();
+  fill_to_bound<per_page * 2>();      // exactly two pages
+  fill_to_bound<per_page * 2 + 1>();
+  fill_to_bound<10000>();             // 9.77 pages
+}
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+//    Splicing across different bounds
+//----------------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+// bounds chosen either side of each other, so both munmap directions are covered
+using SmallBound = msc::vector<int, 64>;
+using MidBound   = msc::vector<int, 100000>;
+
+template<class V>
+V filled(int base, size_t n){
+  V v;
+  for(size_t i = 0; i < n; ++i) v.push_back(base + static_cast<int>(i));
+  return v;
+}
+
+size_t vm_size_kb(){
+  std::ifstream st("/proc/self/status");
+  std::string key;
+  size_t kb = 0;
+  while(st >> key){
+    if(key == "VmSize:"){ st >> kb; break; }
+  }
+  return kb;
+}
+
+} // namespace
+
+
+TEST(vector, splice_accepts_a_different_bound)
+{
+  // the destination's bound governs; the source's only has to be a bound
+  MidBound dst = filled<MidBound>(0, 5);
+  SmallBound a = filled<SmallBound>(10, 4);
+  msc::vector<int> b = filled<msc::vector<int>>(20, 3);
+
+  dst.splice(std::move(a));
+  ASSERT_EQ(dst.size(), 9u);
+  ASSERT_EQ(a.size(), 0u);
+
+  // several at once, each carrying a different bound
+  SmallBound c = filled<SmallBound>(30, 2);
+  dst.splice(std::move(b), std::move(c));
+  ASSERT_EQ(dst.size(), 14u);
+  ASSERT_EQ(b.size(), 0u);
+  ASSERT_EQ(c.size(), 0u);
+
+  std::vector<int> got(dst.begin(), dst.end());
+  std::sort(got.begin(), got.end());
+  ASSERT_EQ(got, (std::vector<int>{0, 1, 2, 3, 4, 10, 11, 12, 13, 20, 21, 22, 30, 31}));
+
+  // a run time number of them, through the range form
+  std::vector<SmallBound> parts;
+  parts.push_back(filled<SmallBound>(40, 2));
+  parts.push_back(filled<SmallBound>(50, 2));
+  dst.splice_range(parts);
+  ASSERT_EQ(dst.size(), 18u);
+  for(const auto& part : parts) ASSERT_EQ(part.size(), 0u);
+}
+
+
+TEST(vector, splice_across_bounds_respects_the_destination)
+{
+  // the source may hold more than the destination's bound allows, and then the
+  // splice has to be refused with both vectors left intact
+  SmallBound dst = filled<SmallBound>(0, 60);
+  MidBound src   = filled<MidBound>(100, 10);
+
+  ASSERT_THROW(dst.splice(std::move(src)), std::length_error);
+  ASSERT_EQ(dst.size(), 60u);
+  ASSERT_EQ(src.size(), 10u) << "a refused splice must not consume the source";
+  for(size_t i = 0; i < 60; ++i) ASSERT_EQ(dst[i], static_cast<int>(i));
+
+  // exactly filling the bound is allowed
+  MidBound fits = filled<MidBound>(200, 4);
+  ASSERT_NO_THROW(dst.splice(std::move(fits)));
+  ASSERT_EQ(dst.size(), 64u);
+  ASSERT_EQ(dst.size(), dst.max_size());
+  ASSERT_EQ(fits.size(), 0u);
+}
+
+
+TEST(vector, splice_across_bounds_releases_the_source_reservation)
+{
+  // the source's reservation is unmapped with the source's own length. Using
+  // the destination's instead leaked the difference on every splice, which for
+  // a 64 GiB source into a smaller bound was 63 GiB of address space a time,
+  // and in the other direction unmapped past the source entirely
+  const size_t n = msc::vector<int>::COPY_LIMIT / sizeof(int) + 1000;  // mremap path
+
+  auto round_trip = [&](auto make_dst, auto make_src){
+    auto dst = make_dst();
+    auto src = make_src();
+    for(size_t i = 0; i < n; ++i) src.push_back(static_cast<int>(i));
+    for(size_t i = 0; i < 800; ++i) dst.push_back(-1);
+    dst.splice(std::move(src));
+    ASSERT_EQ(dst.size(), n + 800);
+    ASSERT_EQ(src.size(), 0u);
+  };
+
+  // source's reservation larger than the destination's
+  size_t before = vm_size_kb();
+  for(int i = 0; i < 4; ++i)
+    round_trip([]{ return msc::vector<int, 200000000>{}; }, []{ return msc::vector<int>{}; });
+  ASSERT_LT(vm_size_kb(), before + 64u * 1024u)
+      << "address space grew: the source's reservation was not fully released";
+
+  // and the other way round
+  before = vm_size_kb();
+  for(int i = 0; i < 4; ++i)
+    round_trip([]{ return msc::vector<int>{}; }, []{ return msc::vector<int, 200000000>{}; });
+  ASSERT_LT(vm_size_kb(), before + 64u * 1024u);
+}
+
+
+TEST(vector, splice_across_bounds_non_trivial)
+{
+  // splice relocates bytes, so no element may be constructed or destroyed, and
+  // that has to hold across bounds too
+  B::reset();
+  {
+    msc::vector<B, 500> dst;
+    msc::vector<B, 64>  src;
+    for(size_t i = 0; i < 40; ++i) dst.emplace_back(i);
+    for(size_t i = 0; i < 20; ++i) src.emplace_back(100 + i);
+
+    const size_t built = B::constructed;
+    const size_t gone  = B::destroyed;
+    dst.splice(std::move(src));
+
+    ASSERT_EQ(dst.size(), 60u);
+    ASSERT_EQ(B::constructed, built);
+    ASSERT_EQ(B::destroyed, gone);
+    ASSERT_EQ(B::live, 60u);
+
+    std::vector<int> got;
+    for(const B& x : dst) got.push_back(x.value());
+    std::sort(got.begin(), got.end());
+    ASSERT_EQ(got.size(), 60u);
+    ASSERT_EQ(got.front(), 0);
+    ASSERT_EQ(got.back(), 119);
+  }
+  ASSERT_EQ(B::live, 0u);
+  ASSERT_EQ(B::destroyed, B::constructed);
 }

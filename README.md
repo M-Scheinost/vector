@@ -10,6 +10,7 @@ See [Limitations](#limitations) for when to not use it.
 
 msc::vector<int> a(1'000'000, 1);
 msc::vector<int> b(1'000'000, 2);
+msc::vector<int,1000> c; // a vector which can hold at maximum 1000 ints
 
 for(std::size_t i = 0; i < a.size(); ++i){
   a.emplace_back(i);
@@ -35,6 +36,39 @@ Every source is left empty and immediately reusable.
 at the end of `dst` that sit past its last boundary are moved behind the
 spliced data. After splicing `{1,2,3}` onto `{a,b,c}` you get all six elements,
 but not necessarily in that order.
+
+### Bounding the reservation
+
+The second template argument is the maximum number of elements the vector will ever hold. It
+is what `max_size()` returns, and asking for more throws `std::length_error`.
+Default size is 64 GiB in bytes, so a vector holds at maximum 64 GiB / sizeof(T) elements.
+```cpp
+msc::vector<int>             a;   // up to 64 GiB worth, reserves 64 GiB
+msc::vector<int, 1'000'000>  b;   // up to a million ints, reserves 4 MiB
+```
+
+This is not about saving memory: a reservation costs no memory until it is
+written. This allows you to set the amount of *address space* each vector occupies.
+Address space is limited so the maximum number of vectors is limited too.
+About 2000 vectors with 64 GiB can live on x86-64. If you have few very large vectors
+you can create them with a larger bound and if you need many small vectors you can
+create them like this too.
+
+A bound is part of the type, as with `std::array`, so `msc::vector<int, 10>` and
+`msc::vector<int, 20>` are unrelated types: they do not convert, compare or
+assign to one another. `splice` is the exception, and takes a source with any
+bound as long as the element type matches:
+
+```cpp
+msc::vector<int, 1'000'000> all;
+msc::vector<int, 1000>      part;
+all.splice(std::move(part));        // fine
+```
+
+The destination's bound is what governs: a source that would push it past
+`max_size()` is refused with `std::length_error`, leaving both vectors as they
+were. The reservation is rounded up to whole pages, so very small bounds all
+cost one page.
 
 ### Iterator stability
 
@@ -124,7 +158,7 @@ spliced data. After splicing `{1,2,3}` onto `{a,b,c}` you get all six elements,
 but not necessarily in that order. If element order is important use the `insert`/`append`
 methods. They work like `std::vectors` methods and never change order.
 
-**The number of simultaneously held vectors is limited** Each vector reserves a virtual address range. Virtual addresses are limited, which limits vectors. Empty/Unused/Cleared vectors reserve their address ranges. Rule of thumb ~2000 vectors are no problem and deconstruct vectors when they aren't needed anymore.
+**The number of simultaneously held vectors is limited** Each vector reserves a virtual address range. Virtual addresses are limited, which limits vectors. Empty/Unused/Cleared vectors reserve their address ranges. Rule of thumb ~2000 vectors are no problem and deconstruct vectors when they aren't needed anymore. A smaller `MaxSize` shrinks the reservation and raises that ceiling proportionally, so a vector with a known bound is not subject to it in practice.
 
 **4 KiB pages are assumed.** ARM64 might have different ones
 
